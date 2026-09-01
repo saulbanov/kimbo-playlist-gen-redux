@@ -42,11 +42,7 @@ Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolv
 
 ### The playlist rack
 
-`playlists/` ships the ten curated playlists this tool was built around — the devil-in-a-suit protest rack (suit-and-tie sessions, new wave, company town, the groove, austerity isles, black waters, oil anti-canon, the 115-track full flow and 58-track tight cut) plus "Nowhere to Make Out," the place-as-pleasure set seeded from Paul Cauthen's "Bayou By You." Each has a CSV (`kimbo.py import` or TuneMyMusic) and a TXT twin (Spotlistr). `playlists/README.md` has the table and the known search misses. Import one with:
-
-```
-python3 kimbo.py import --csv playlists/10-nowhere-to-make-out.csv --title "Nowhere to Make Out"
-```
+The ten curated playlists this tool was built around live in their own repo, [suit-and-tie](https://github.com/saulbanov/suit-and-tie) — import any of its `playlists/*.csv` with `kimbo.py import`. Two stay here in `examples/` for smoke-testing.
 
 ### CSV format
 
