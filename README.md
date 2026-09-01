@@ -76,3 +76,7 @@ TuneMyMusic has **no public API** — the CSV format *is* the integration. `impo
 - Genius `search_songs` matches titles/metadata, then kimbo scores full lyrics. True lyric-text search isn't in Genius's public API, so discovery breadth is bounded by what the query surfaces — run several phrasings.
 - GetSongBPM rate-limits the free tier; `enrich` sleeps 0.6s between lookups. A 115-track list takes ~90 seconds.
 - Two different recordings of one song (single vs. album) have different Spotify IDs; the duplicate guard is by ID, so a re-import can occasionally re-add the *other* recording. Fix by hand when it happens.
+
+## Credits
+
+Tempo and key data in the `enrich` and `resort` commands is provided by **[GetSongBPM](https://getsongbpm.com)** — a free, community-maintained database of song tempo, key and time signature. Lyrics for the `discover` command come from [Genius](https://genius.com) via [lyricsgenius](https://github.com/johnwmillr/LyricsGenius). Spotify access uses [Spotipy](https://spotipy.readthedocs.io).
