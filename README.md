@@ -1,6 +1,6 @@
 # kimbo-playlist-gen-redux
 
-A command-line tool that moves playlists between spreadsheets and Spotify, and finds songs by what their lyrics actually say. You give it a simple song list and it builds the playlist in your Spotify account, in your order, telling you which songs it couldn't find. It can also run the other direction — turn any playlist you own back into a list — and it can go hunting: give it a phrase like "company store" and it scores songs by how much of their lyrics that phrase occupies, collecting the hits for you to review. Built for one person curating thematic playlists faster than clicking through an app.
+A command-line tool that moves playlists between spreadsheets and Spotify, and finds songs by what their lyrics actually say. You give it a simple song list and it builds the playlist in your Spotify account, in your order, telling you which songs it couldn't find. It can also run the other direction — turn any playlist you own back into a list — and it can go hunting: give it a phrase like "company store" and it scores songs by how much of their lyrics that phrase occupies, collecting the hits for you to review. It can also reorder a playlist so it plays smoothly, sequencing by musical key, tempo and energy the way a DJ would. Built for one person curating thematic playlists faster than clicking through an app.
 
 ## How it works
 
@@ -8,7 +8,9 @@ You start with a song list — a spreadsheet with two columns, song and artist, 
 
 The reverse trip works the same way. Point it at any playlist you own and it writes the song list back out as a spreadsheet — the same format other transfer services accept, so a playlist built here can be carried on to Apple Music or YouTube through those services.
 
-Discovery is the part no app does. You give it a phrase, and it searches a lyrics database for songs, reads each song's full lyrics, and measures how much of the text your phrase takes up. Songs above a threshold you set are collected into a separate candidates playlist — never into your real ones — so a human decision still sits between the machine's guesses and the playlist you'd actually play for someone. Finally, an enrichment pass can look up each song's tempo and musical key from a public database and write them into your spreadsheet, so you can re-order a long playlist by feel.
+Discovery is the part no app does. You give it a phrase, and it searches a lyrics database for songs, reads each song's full lyrics, and measures how much of the text your phrase takes up. Songs above a threshold you set are collected into a separate candidates playlist — never into your real ones — so a human decision still sits between the machine's guesses and the playlist you'd actually play for someone.
+
+Last, it can order a playlist so it *flows*. An enrichment pass looks up each song's tempo and musical key from a public database, and then the ordering pass sequences the list the way a DJ would: neighbouring musical keys, tempos that match (counting half and double speed as a match, because they beatmatch), all shaped to an energy curve you pick for the occasion. The one thing it won't do is guess how a song feels — that judgment it hands to you or an assistant, because it's exactly what the machine gets wrong.
 
 ## Nitty gritty
 
@@ -38,9 +40,11 @@ python3 kimbo.py enrich   --csv list.csv                # writes list-enriched.c
 python3 kimbo.py enrich   --playlist-id 3cEYpjA9...     # tempo/key for a live playlist
 python3 kimbo.py resort   --title "Black Waters" --by key-tempo --dry-run
 python3 kimbo.py resort   --title "Black Waters" --by tempo    # reorder in place
+python3 kimbo.py flow     --csv list-enriched.csv --arc party   # writes list-enriched-flow.csv
+python3 kimbo.py flow     --playlist-id 3cEYpjA9... --apply     # new "<name> (flow)" playlist
 ```
 
-Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages).
+Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages). `flow --arc flat|steady|party|chill|build`, `--tag-prompt` (write the vibe-tagging prompt), `--apply` / `--in-place` (push the new order back).
 
 
 ### The playlist rack
@@ -53,7 +57,39 @@ Header `Track name, Artist name, Album` (TuneMyMusic's format — the files in `
 
 ### Tempo and key: the honest state
 
-Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For accurate, complete values the real options are local: **librosa/Essentia** analysis of audio files you own, or **Mixed In Key / rekordbox** if the goal is DJ-grade key matching — both analyze actual audio rather than looking anything up. `resort` reorders a playlist in place using that data: `--by tempo` (slow-to-fast ramp), `--by key` (around the Camelot wheel, so neighbours mix harmonically), or `--by key-tempo` (key groups with tempo ramps inside). Always try `--dry-run` first; unknowns sink to the bottom in their current order.
+Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For accurate, complete values the real options are local: **librosa/Essentia** analysis of audio files you own, or **Mixed In Key / rekordbox** if the goal is DJ-grade key matching — both analyze actual audio rather than looking anything up. `resort` reorders a playlist in place using that data: `--by tempo` (slow-to-fast ramp), `--by key` (around the Camelot wheel, so neighbours mix harmonically), or `--by key-tempo` (key groups with tempo ramps inside). Always try `--dry-run` first; unknowns sink to the bottom in their current order. For chaining rather than sorting, see **Flow** below.
+
+### Flow: making a playlist play smoothly
+
+`flow` reorders a playlist so it plays like a set instead of a shuffle. It works on three things at once.
+
+**Key.** Songs in neighbouring musical keys blend; songs in distant ones clash. `flow` converts each key to its Camelot number — the wheel DJs use — and prefers neighbours.
+
+**Tempo.** Obvious, with one twist: a 174 BPM track into an 87 BPM one is not a jump, it's the same pulse at half speed, and it beatmatches cleanly. `flow` knows this, so it stops splitting up pairs that actually belong together. Spotify's auto-mix makes the same move, which is why its "wild" tempo swings usually sound fine.
+
+**Energy arc.** Pick the shape of the night with `--arc`: `party` (warm up, build, peak, wind down), `steady` (hold one level — a bike ride), `chill` (gentle descent), `build` (straight climb — a workout), or `flat` (no arc, just the smoothest possible chain of songs).
+
+It prints every transition with a verdict — `smooth`, `key jump`, `tempo jump`, or `?` where data is missing — and a count of rough joins before and after, so you can see what it bought you.
+
+#### The vibe pass
+
+Tempo and key are lookups. How a song *feels* is a judgment, and it's the one thing auto-mix gets wrong: group by tempo alone and a delicate 155 BPM piano piece lands next to an actual banger. So `flow` doesn't guess it.
+
+```
+python3 kimbo.py flow --csv list-enriched.csv --tag-prompt
+```
+
+That writes a prompt with your tracklist in it. Paste it to any assistant, save the reply as a CSV, and run `flow` on that file. The `Energy` (1-5) and `Vibe` columns now carry a real judgment, and the ordering uses them. Without those columns `flow` falls back to ranking by tempo, which is exactly the mistake described above — usable, but the tagging pass is the part that earns the effort.
+
+#### Writing it back
+
+By default `flow` only writes a CSV; your playlists are untouched. `--apply` creates a **new private** playlist called `<name> (flow)`. `--in-place` overwrites the original — Spotify keeps no undo for that, so `flow` saves the original order to `<name>-before-flow.csv` first and refuses to proceed if it can't.
+
+#### When it's worth it
+
+For background listening — a garden party, dinner, kids running around — Spotify's own auto-mix is good enough and takes zero effort. Nobody feels a missing energy arc while they're grazing. Save `flow` for when the sequence actually gets felt: a ride at one tempo, a dance floor, a set someone is paying attention to.
+
+Tempo and key come from GetSongBPM (see above), whose terms require a visible link back to [getsongbpm.com](https://getsongbpm.com) wherever you publish their data.
 
 ### TuneMyMusic integration: what's real
 

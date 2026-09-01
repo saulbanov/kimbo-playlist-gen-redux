@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """kimbo - playlist plumbing for Spotify.
 
-Redux of the old playlist-generator script. Five subcommands:
+Redux of the old playlist-generator script. Six subcommands:
 
   setup     guided walkthrough: get every credential, store and test them
   import    CSV -> Spotify playlist (ordered, deduped, reports misses);
@@ -12,6 +12,7 @@ Redux of the old playlist-generator script. Five subcommands:
             audio-features, when your app still has access)
   resort    reorder a playlist in place by tempo, key (Camelot wheel),
             or key-then-tempo
+  flow      chain tracks by key/tempo/energy so the playlist plays smoothly
 
 Run `python3 kimbo.py <command> -h` for options. Credentials come from
 environment variables; see .env.example.
@@ -19,6 +20,8 @@ environment variables; see .env.example.
 
 import argparse
 import csv
+import json
+import math
 import os
 import re
 import sys
@@ -442,6 +445,77 @@ def getsongbpm_lookup(session, api_key, title, artist):
     return (tempo, key, "getsongbpm") if tempo or key else None
 
 
+BPM_CACHE_PATH = os.path.expanduser("~/.cache/kimbo/getsongbpm-cache.json")
+
+
+def load_bpm_cache(path=None):
+    """Remembered lookups: {"title|artist": [tempo, key]}.
+
+    Grown one real playlist at a time - which is the honest version of
+    "just scrape every song ever"."""
+    try:
+        with open(path or BPM_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+def save_bpm_cache(cache, path=None):
+    """Best effort - a cache we cannot write is not worth failing a run for."""
+    path = path or BPM_CACHE_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except (IOError, OSError) as exc:
+        warn("could not write %s: %s" % (path, exc))
+
+
+def getsongbpm_notice(api_key):
+    """The credit GetSongBPM's terms require, or the nudge to get a key."""
+    if not api_key:
+        warn("GETSONGBPM_KEY not set - only Spotify-side data was attempted. "
+             "Free key at getsongbpm.com/api")
+    else:
+        print("Note: GetSongBPM's terms require a visible link back to "
+              "getsongbpm.com wherever you publish their data.")
+
+
+def gather_tempo_key(sp, rows3, ids):
+    """(tempo, key, source) per row, aligned with rows3.
+
+    Spotify's own features first for grandfathered apps, then the local
+    cache, then a GetSongBPM lookup."""
+    by_id = {}
+    if ids and sp:
+        by_id = spotify_features(sp, ids)
+
+    api_key = os.environ.get("GETSONGBPM_KEY")
+    cache = load_bpm_cache() if api_key else {}
+    session = requests.Session()
+    found, learned = [], False
+    for i, (title, artist, album) in enumerate(rows3):
+        tempo, key, source = "", "", ""
+        if ids and i < len(ids) and ids[i] in by_id:
+            tempo, key, source = by_id[ids[i]]
+        elif api_key:
+            slot = ("%s|%s" % (title, artist)).lower()
+            if slot in cache:
+                tempo, key, source = cache[slot][0], cache[slot][1], "cache"
+            else:
+                hit = getsongbpm_lookup(session, api_key, title, artist)
+                if hit:
+                    tempo, key, source = hit
+                    cache[slot], learned = [tempo, key], True
+                time.sleep(0.6)          # be polite; free tier rate-limits
+        found.append((tempo, key, source))
+        print("  %-7s %-4s %s - %s" % (tempo or "-", key or "-", artist, title))
+    if learned:
+        save_bpm_cache(cache)
+    return found
+
+
 def cmd_enrich(args):
     if not args.csv and not args.playlist_id:
         die("pass --csv or --playlist-id")
@@ -453,24 +527,9 @@ def cmd_enrich(args):
         rows3 = [(t, a, "") for t, a in read_rows(args.csv)]
         ids = []
 
-    by_id = {}
-    if ids and sp:
-        by_id = spotify_features(sp, ids)
-
-    api_key = os.environ.get("GETSONGBPM_KEY")
-    session = requests.Session()
-    out_rows = []
-    for i, (title, artist, album) in enumerate(rows3):
-        tempo, key, source = "", "", ""
-        if ids and i < len(ids) and ids[i] in by_id:
-            tempo, key, source = by_id[ids[i]]
-        elif api_key:
-            hit = getsongbpm_lookup(session, api_key, title, artist)
-            if hit:
-                tempo, key, source = hit
-            time.sleep(0.6)          # be polite; free tier rate-limits
-        out_rows.append([title, artist, album, tempo, key, source])
-        print("  %-7s %-4s %s - %s" % (tempo or "-", key or "-", artist, title))
+    out_rows = [[title, artist, album, tempo, key, source]
+                for (title, artist, album), (tempo, key, source)
+                in zip(rows3, gather_tempo_key(sp, rows3, ids))]
 
     out = args.out or ((args.csv or "playlist").rsplit(".csv", 1)[0] + "-enriched.csv")
     with open(out, "w", newline="", encoding="utf-8") as f:
@@ -479,13 +538,470 @@ def cmd_enrich(args):
         writer.writerows(out_rows)
     filled = sum(1 for r in out_rows if r[3] or r[4])
     print("\nWrote %s (%d/%d rows enriched)." % (out, filled, len(out_rows)))
-    if not api_key:
-        warn("GETSONGBPM_KEY not set - only Spotify-side data was attempted. "
-             "Free key at getsongbpm.com/api")
-    else:
-        print("Note: GetSongBPM's terms require a visible link back to "
-              "getsongbpm.com wherever you publish their data.")
+    getsongbpm_notice(os.environ.get("GETSONGBPM_KEY"))
 
+
+
+# ------------------------------------------------------------------- flow ---
+
+# Enharmonic flats -> the sharp names used in PITCH_CLASSES.
+FLAT_TO_SHARP = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#",
+                 "Bb": "A#", "Cb": "B", "Fb": "E"}
+
+# (root as sharp name, is_minor) -> Camelot code. The full 24-key wheel:
+# neighbours on the wheel (+/-1, or the same number in the other letter)
+# are the pairs DJs treat as harmonically compatible.
+CAMELOT = {
+    ("G#", True): "1A",  ("B", False): "1B",
+    ("D#", True): "2A",  ("F#", False): "2B",
+    ("A#", True): "3A",  ("C#", False): "3B",
+    ("F", True): "4A",   ("G#", False): "4B",
+    ("C", True): "5A",   ("D#", False): "5B",
+    ("G", True): "6A",   ("A#", False): "6B",
+    ("D", True): "7A",   ("F", False): "7B",
+    ("A", True): "8A",   ("C", False): "8B",
+    ("E", True): "9A",   ("G", False): "9B",
+    ("B", True): "10A",  ("D", False): "10B",
+    ("F#", True): "11A", ("A", False): "11B",
+    ("C#", True): "12A", ("E", False): "12B",
+}
+
+FLOW_W_KEY = 1.0         # weight: harmonic compatibility
+FLOW_W_BPM = 1.0         # weight: tempo distance
+FLOW_W_ARC = 0.8         # weight: fit to the energy arc
+FLOW_UNKNOWN_PEN = 0.3   # neutral penalty when key or tempo is unknown
+FLOW_SMOOTH_KEY = 0.25   # max key penalty still called "smooth"
+FLOW_SMOOTH_BPM = 0.09   # max tempo log2-distance still called "smooth" (~6%)
+
+# Energy curve per arc as (position 0..1, energy 1..5) breakpoints, linearly
+# interpolated. The arc is the part you pick per occasion; the key and tempo
+# math below is the same either way.
+ARC_BREAKPOINTS = {
+    "flat":   None,                                   # no arc: pure key/tempo chaining
+    "steady": [(0.0, 3.0), (1.0, 3.0)],               # hold one level (bike ride)
+    "party":  [(0.0, 2.0), (0.15, 3.0), (0.7, 5.0),   # warm up, build, peak,
+               (0.85, 5.0), (1.0, 2.5)],              # wind down
+    "chill":  [(0.0, 3.5), (1.0, 1.5)],               # gentle descent
+    "build":  [(0.0, 1.5), (1.0, 5.0)],               # straight climb (workout)
+}
+
+FLOW_CSV_HEADER = CSV_HEADER + ["Tempo", "Key", "Camelot", "Energy",
+                                "Vibe", "Source"]
+
+# Handed to whatever assistant the user already has. Tempo and key are
+# lookups; how a track FEELS is the judgment call, so we ask for it rather
+# than pretending a number implies it.
+FLOW_TAG_PROMPT = """You are tagging songs for playlist ordering. For each track in the CSV
+below, fill in the Energy column with a rating from 1 (sleepy, ambient)
+to 5 (peak, floor-filling), judging how the track FEELS, not how fast it
+is - a delicate piano piece can be fast and still low energy. Fill in the
+Vibe column with one word (e.g. dreamy, swagger, sunshine, brooding).
+Reply with ONLY the completed CSV: same columns, same row order, nothing
+else. If you don't know a track, rate it 3 and guess the vibe from the
+title."""
+
+
+def normalize_key(raw):
+    """('A#', True) for 'Bbm'. None when missing or unparseable.
+
+    Accepts what GetSongBPM and djay screenshots actually contain: flats,
+    unicode accidentals, and 'minor'/'min'/'m' spellings."""
+    if raw is None:
+        return None
+    text = str(raw).replace("\u266f", "#").replace("\u266d", "b").strip()
+    if not text or text == "?":
+        return None
+    is_minor = False
+    lowered = text.lower()
+    for suffix in ("minor", "min", "m"):        # longest first
+        if lowered.endswith(suffix):
+            text, is_minor = text[:-len(suffix)], True
+            break
+    else:
+        for suffix in ("major", "maj"):
+            if lowered.endswith(suffix):
+                text = text[:-len(suffix)]
+                break
+    text = text.strip()
+    if not text:
+        return None
+    root = text[0].upper() + text[1:].lower()
+    root = FLAT_TO_SHARP.get(root, root)
+    return (root, is_minor) if root in PITCH_CLASSES else None
+
+
+def to_camelot(raw):
+    """'Am' -> '8A'. None when the key is missing or unparseable."""
+    parts = normalize_key(raw)
+    return CAMELOT.get(parts) if parts else None
+
+
+def camelot_parts(code):
+    """'11A' -> (11, 'A')."""
+    return int(code[:-1]), code[-1]
+
+
+def key_penalty(camelot_a, camelot_b):
+    """0.0 for the same key, rising with distance around the wheel.
+
+    An unknown key on either side scores FLOW_UNKNOWN_PEN - worse than a
+    neighbour, better than the far side of the wheel."""
+    if not camelot_a or not camelot_b:
+        return FLOW_UNKNOWN_PEN
+    num_a, letter_a = camelot_parts(camelot_a)
+    num_b, letter_b = camelot_parts(camelot_b)
+    ring = min((num_a - num_b) % 12, (num_b - num_a) % 12)
+    return min(1.0, 0.15 * ring + 0.25 * (0 if letter_a == letter_b else 1))
+
+
+def bpm_gap(tempo_a, tempo_b):
+    """(log2 distance, ratio) for the closest of half, same, or double time.
+
+    174 into 87 is a clean beatmatch rather than a jarring jump - the real
+    DJ move that a naive tempo sort mistakes for whiplash. Callers must
+    check both tempos are known and positive first; this does not."""
+    best = None
+    for ratio in (0.5, 1.0, 2.0):
+        dist = abs(math.log2(tempo_b * ratio / tempo_a))
+        if best is None or dist < best[0] - 1e-9:
+            best = (dist, ratio)
+        elif abs(dist - best[0]) <= 1e-9 and ratio == 1.0:
+            best = (dist, ratio)          # a straight match wins a tie
+    return best
+
+
+def bpm_penalty(tempo_a, tempo_b):
+    """0.0 for an exact (or half/double) match, 1.0 for a wide jump."""
+    if not tempo_a or not tempo_b or tempo_a <= 0 or tempo_b <= 0:
+        return FLOW_UNKNOWN_PEN
+    return min(1.0, bpm_gap(tempo_a, tempo_b)[0] / 0.5)
+
+def arc_targets(name, n):
+    """Target energy for each of n slots, or n Nones for the 'flat' arc."""
+    breakpoints = ARC_BREAKPOINTS[name]
+    if breakpoints is None:
+        return [None] * n
+    targets = []
+    for i in range(n):
+        position = 0.0 if n == 1 else float(i) / (n - 1)
+        energy = breakpoints[-1][1]           # past the end: hold the last
+        for (pos_a, energy_a), (pos_b, energy_b) in zip(breakpoints, breakpoints[1:]):
+            if position <= pos_b:
+                frac = 0.0 if pos_b == pos_a else (position - pos_a) / (pos_b - pos_a)
+                energy = energy_a + (energy_b - energy_a) * frac
+                break
+        targets.append(energy)
+    return targets
+
+
+def effective_energies(tracks):
+    """Per-track energy on a 1-5 scale.
+
+    A tagged Energy column always wins. Without one we fall back to a crude
+    tempo rank, which is exactly the judgment tempo cannot make: a delicate
+    155 BPM piano piece reads as high energy here and is not."""
+    n = len(tracks)
+    if any(track.get("energy") is not None for track in tracks):
+        return [float(min(5.0, max(1.0, track["energy"])))
+                if track.get("energy") is not None else 3.0 for track in tracks]
+    known = [i for i in range(n) if tracks[i].get("tempo")]
+    if not known:
+        return [3.0] * n
+    energies = [3.0] * n
+    for rank, i in enumerate(sorted(known, key=lambda i: (tracks[i]["tempo"], i))):
+        energies[i] = (3.0 if len(known) == 1
+                       else 1.0 + 4.0 * rank / (len(known) - 1))
+    return energies
+
+
+def transition_cost(prev, cand, cand_energy, slot_target):
+    """What it costs to play cand straight after prev in this arc slot."""
+    cost = FLOW_W_KEY * key_penalty(prev["camelot"], cand["camelot"])
+    cost += FLOW_W_BPM * bpm_penalty(prev["tempo"], cand["tempo"])
+    if slot_target is not None:
+        cost += FLOW_W_ARC * abs(cand_energy - slot_target) / 4.0
+    return cost
+
+
+def order_tracks(tracks, arc):
+    """Input indices in play order.
+
+    Greedy: from each track take the cheapest next one. Not optimal - that
+    is a travelling-salesman problem - but deterministic and good enough to
+    hear. Ties go to the lowest index."""
+    n = len(tracks)
+    if n <= 1:
+        return list(range(n))
+    targets = arc_targets(arc, n)
+    energies = effective_energies(tracks)
+    if arc == "flat":
+        start = 0                              # keep the opener the user chose
+    else:
+        start = min(range(n), key=lambda i: (abs(energies[i] - targets[0]), i))
+    order, used = [start], set([start])
+    for slot in range(1, n):
+        prev, best, best_cost = tracks[order[-1]], None, None
+        for i in range(n):
+            if i in used:
+                continue
+            cost = transition_cost(prev, tracks[i], energies[i], targets[slot])
+            if best_cost is None or cost < best_cost - 1e-9:
+                best, best_cost = i, cost
+        order.append(best)
+        used.add(best)
+    return order
+
+def _flow_float(text):
+    """'98' -> 98.0; blank or junk -> None. Missing data stays missing."""
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _flow_num(value):
+    """98.0 -> '98', None -> ''."""
+    return "" if value is None else "%g" % value
+
+
+def read_enriched_rows(path):
+    """Track dicts from a CSV.
+
+    Everything past title and artist is optional: a plain two-column list
+    reads fine, it just has nothing to order by until `enrich` has run."""
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        die("%s is empty" % path)
+    header = [c.strip().lower() for c in rows[0]]
+    if "track name" in header:
+        index = dict((name, i) for i, name in enumerate(header))
+        body = rows[1:]
+    else:
+        index = {"track name": 0, "artist name": 1}
+        body = rows                      # headerless: row 1 is a track
+    tracks = []
+    for row in body:
+        cell = lambda name: (row[index[name]].strip()
+                             if name in index and index[name] < len(row) else "")
+        title = cell("track name")
+        if not title:
+            continue
+        key = cell("key")
+        tracks.append({"title": title, "artist": cell("artist name"),
+                       "album": cell("album"), "tempo": _flow_float(cell("tempo")),
+                       "key": key, "camelot": to_camelot(key),
+                       "energy": _flow_float(cell("energy")),
+                       "vibe": cell("vibe"), "source": cell("source")})
+    return tracks
+
+
+def join_quality(prev, cand):
+    """(note, smooth, comparable) for the join from prev into cand.
+
+    Missing data is checked first and reported as '?' rather than guessed:
+    bpm_gap does arithmetic on both tempos and cannot take a None."""
+    have_key = bool(prev["camelot"] and cand["camelot"])
+    have_tempo = bool(prev["tempo"] and cand["tempo"]
+                      and prev["tempo"] > 0 and cand["tempo"] > 0)
+    key_ok = (have_key and
+              key_penalty(prev["camelot"], cand["camelot"]) <= FLOW_SMOOTH_KEY)
+    tempo_ok, ratio = False, 1.0
+    if have_tempo:
+        distance, ratio = bpm_gap(prev["tempo"], cand["tempo"])
+        tempo_ok = distance <= FLOW_SMOOTH_BPM
+    if have_key and have_tempo and key_ok and tempo_ok:
+        return ("smooth (half/double-time)" if ratio != 1.0 else "smooth",
+                True, True)
+    problems = []
+    problems.append("key ?" if not have_key else ("key jump" if not key_ok else ""))
+    problems.append("tempo ?" if not have_tempo
+                    else ("tempo jump" if not tempo_ok else ""))
+    return ", ".join(p for p in problems if p), False, have_key and have_tempo
+
+
+def rough_transitions(tracks, order):
+    """How many joins are bumpy among those we can actually judge."""
+    rough = 0
+    for before, after in zip(order, order[1:]):
+        _, smooth, comparable = join_quality(tracks[before], tracks[after])
+        if comparable and not smooth:
+            rough += 1
+    return rough
+
+
+def flow_report(tracks, order, arc):
+    """Printable lines: the play order, and how each join sounds."""
+    lines = ["Flow order (arc: %s):" % arc]
+    smooth_total = 0
+    for slot, i in enumerate(order):
+        track, note = tracks[i], ""
+        if slot:
+            note, smooth, _ = join_quality(tracks[order[slot - 1]], track)
+            smooth_total += 1 if smooth else 0
+        label = "%s - %s" % (track["artist"], track["title"])
+        if len(label) > 38:
+            label = label[:35] + "..."
+        lines.append("  %3d. %-38s %5s %-4s %-4s %-3s %s"
+                     % (slot + 1, label, _flow_num(track["tempo"]) or "-",
+                        track["key"] or "-", track["camelot"] or "-",
+                        _flow_num(track["energy"]) or "-", note))
+    lines.append("")
+    lines.append("Transitions: %d total, %d smooth"
+                 % (max(len(order) - 1, 0), smooth_total))
+    lines.append("Rough transitions: input order %d -> flow order %d"
+                 % (rough_transitions(tracks, list(range(len(tracks)))),
+                    rough_transitions(tracks, order)))
+    return lines
+
+
+def write_flow_csv(path, tracks, order):
+    """The reordered list, ready to hand back to `import`."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(FLOW_CSV_HEADER)
+        for i in order:
+            track = tracks[i]
+            writer.writerow([track["title"], track["artist"], track["album"],
+                             _flow_num(track["tempo"]), track["key"],
+                             track["camelot"] or "", _flow_num(track["energy"]),
+                             track["vibe"], track["source"]])
+
+
+def write_tagging_prompt(source, out):
+    """The prompt block, then the CSV with Energy/Vibe columns to fill in."""
+    with open(source, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        die("%s is empty" % source)
+    if "track name" in [c.strip().lower() for c in rows[0]]:
+        head, body = list(rows[0]), [list(r) for r in rows[1:]]
+    else:
+        head, body = ["Track name", "Artist name"], [list(r) for r in rows]
+    present = [c.strip().lower() for c in head]
+    for column in ("Energy", "Vibe"):
+        if column.lower() not in present:
+            head.append(column)
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        f.write(FLOW_TAG_PROMPT + "\n\n")
+        writer = csv.writer(f)
+        writer.writerow(head)
+        for row in body:
+            writer.writerow(row + [""] * (len(head) - len(row)))
+
+
+def slugify(name):
+    """'Garden Party!' -> 'garden-party', for use in a filename."""
+    slug = "".join(c for c in name.lower().replace(" ", "-")
+                   if c.isalnum() or c in "-_")
+    return slug.strip("-") or "playlist"
+
+
+def add_in_batches(sp, playlist_id, track_ids):
+    """Spotify takes 100 items per call."""
+    for start in range(0, len(track_ids), 100):
+        sp.playlist_add_items(playlist_id, track_ids[start:start + 100])
+
+
+def flow_write_back(sp, args, name, tracks, order):
+    """Push the new order to Spotify - only when explicitly asked."""
+    ordered_ids = [tracks[i]["spotify_id"] for i in order
+                   if tracks[i].get("spotify_id")]
+    dropped = len(order) - len(ordered_ids)
+    if args.apply:
+        new_name = "%s (flow)" % name
+        new_id = sp.user_playlist_create(
+            sp.me()["id"], new_name, public=False,
+            description="kimbo flow: %s arc" % args.arc)["id"]
+        add_in_batches(sp, new_id, ordered_ids)
+        if dropped:
+            warn("%d track(s) had no Spotify id and were left out" % dropped)
+        print("Created private playlist '%s' with %d tracks."
+              % (new_name, len(ordered_ids)))
+        print("Playlist: https://open.spotify.com/playlist/" + new_id)
+        return
+
+    # --in-place overwrites the playlist and Spotify keeps no undo, so the
+    # original order goes to disk before anything is touched.
+    backup = slugify(name) + "-before-flow.csv"
+    try:
+        write_flow_csv(backup, tracks, list(range(len(tracks))))
+    except (IOError, OSError) as exc:
+        die("could not write the backup %s (%s) - refusing to overwrite "
+            "the playlist" % (backup, exc))
+    print("Original order saved to %s" % backup)
+    if dropped:
+        warn("%d track(s) have no Spotify id and will be dropped" % dropped)
+    sp.playlist_replace_items(args.playlist_id, ordered_ids[:100])
+    add_in_batches(sp, args.playlist_id, ordered_ids[100:])
+    print("Reordered '%s' in place (%d tracks)." % (name, len(ordered_ids)))
+    print("Playlist: https://open.spotify.com/playlist/" + args.playlist_id)
+
+
+def flow_from_playlist(args):
+    """Pull a playlist, look up tempo and key, return (name, tracks, sp)."""
+    sp = spotify_client()
+    rows3 = playlist_rows(sp, args.playlist_id)
+    ids = playlist_track_ids(sp, args.playlist_id)
+    name = sp.playlist(args.playlist_id)["name"]
+    if not rows3:
+        die("playlist '%s' has no tracks" % name)
+    print("Reading tempo and key for %d tracks in '%s'..." % (len(rows3), name))
+    found = gather_tempo_key(sp, rows3, ids)
+    getsongbpm_notice(os.environ.get("GETSONGBPM_KEY"))
+
+    tracks = []
+    for i, ((title, artist, album), (tempo, key, source)) in enumerate(zip(rows3, found)):
+        tracks.append({"title": title, "artist": artist, "album": album,
+                       "tempo": _flow_float(tempo), "key": key or "",
+                       "camelot": to_camelot(key), "energy": None, "vibe": "",
+                       "source": source,
+                       "spotify_id": ids[i] if i < len(ids) else None})
+    print("\nNo Energy column here, so tempo stands in for how a track feels.")
+    print("For vibe-aware ordering: export, enrich, flow --tag-prompt, then flow.")
+    return sp, name, tracks
+
+
+def cmd_flow(args):
+    if bool(args.csv) == bool(args.playlist_id):
+        die("pass exactly one of --csv or --playlist-id")
+    if args.tag_prompt and args.playlist_id:
+        die("--tag-prompt needs a CSV - run `export` then `enrich` first")
+    if args.apply and args.in_place:
+        die("pass --apply or --in-place, not both")
+    if args.csv and (args.apply or args.in_place):
+        die("--apply and --in-place need --playlist-id")
+
+    if args.tag_prompt:
+        out = args.out or (args.csv.rsplit(".csv", 1)[0] + "-tagging.txt")
+        write_tagging_prompt(args.csv, out)
+        print("Wrote %s" % out)
+        print("Paste it to any assistant, save the reply as a CSV, then run:")
+        print("  python3 kimbo.py flow --csv <that file>")
+        return
+
+    sp = name = None
+    if args.playlist_id:
+        sp, name, tracks = flow_from_playlist(args)
+        default_out = slugify(name) + "-flow.csv"
+    else:
+        tracks = read_enriched_rows(args.csv)
+        if not tracks:
+            die("no tracks found in %s" % args.csv)
+        if not any(track["tempo"] or track["camelot"] for track in tracks):
+            warn("no tempo or key in %s - run enrich first for harmonic "
+                 "ordering" % args.csv)
+        default_out = args.csv.rsplit(".csv", 1)[0] + "-flow.csv"
+
+    order = order_tracks(tracks, args.arc)
+    for line in flow_report(tracks, order, args.arc):
+        print(line)
+    out = args.out or default_out
+    write_flow_csv(out, tracks, order)
+    print("\nWrote %s (%d tracks in play order)." % (out, len(order)))
+
+    if args.apply or args.in_place:
+        flow_write_back(sp, args, name, tracks, order)
 
 
 # ------------------------------------------------------------------ setup ---
@@ -627,27 +1143,15 @@ def cmd_setup(args):
 
 # ----------------------------------------------------------------- resort ---
 
-FLAT_TO_SHARP = {"DB": "C#", "EB": "D#", "GB": "F#", "AB": "G#", "BB": "A#",
-                 "CB": "B", "FB": "E"}
-
-
 def camelot(key_str):
-    """Map a key name ('Em', 'F#', 'Bb', 'C#m') to its Camelot wheel slot
-    (number 1-12, letter A=minor/B=major). Returns None if unparseable.
-    Adjacent numbers and same-number A/B pairs mix harmonically."""
-    if not key_str:
-        return None
-    k = key_str.strip().replace("\u266f", "#").replace("\u266d", "b")
-    minor = k.lower().endswith("min") or (k.endswith("m") and not k.lower().endswith("maj"))
-    root = re.sub(r"(?i)(maj|min|m)$", "", k).strip().upper()
-    root = FLAT_TO_SHARP.get(root, root)
-    if root not in PITCH_CLASSES:
-        return None
-    pc = PITCH_CLASSES.index(root)
-    if minor:
-        pc = (pc + 3) % 12          # relative major shares the slot number
-    number = ((pc * 7) % 12 + 7) % 12 + 1
-    return (number, "A" if minor else "B")
+    """(number 1-12, letter A=minor/B=major) for a key name, or None.
+
+    Delegates to the flow section's converter so the two commands cannot
+    drift apart - they had separate FLAT_TO_SHARP tables with different
+    capitalisation, and whichever loaded second silently broke the other's
+    flat keys."""
+    code = to_camelot(key_str)
+    return camelot_parts(code) if code else None
 
 
 def sort_key(row, by):
@@ -769,6 +1273,21 @@ def main():
     p.add_argument("--playlist-id")
     p.add_argument("--out")
     p.set_defaults(func=cmd_enrich)
+
+    p = sub.add_parser("flow", help="reorder so the playlist plays smoothly")
+    p.add_argument("--csv", help="an enriched CSV (see `enrich`)")
+    p.add_argument("--playlist-id", help="reorder a playlist you own")
+    p.add_argument("--arc", default="party",
+                   choices=["flat", "steady", "party", "chill", "build"],
+                   help="energy curve to shape the set around (default party)")
+    p.add_argument("--tag-prompt", action="store_true",
+                   help="write an LLM prompt for filling in Energy/Vibe")
+    p.add_argument("--apply", action="store_true",
+                   help="create a new private '<name> (flow)' playlist")
+    p.add_argument("--in-place", action="store_true",
+                   help="overwrite the playlist itself (saves the old order first)")
+    p.add_argument("--out", help="output path (default: <input>-flow.csv)")
+    p.set_defaults(func=cmd_flow)
 
     load_env_file()
     args = parser.parse_args()
