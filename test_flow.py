@@ -173,7 +173,8 @@ class TestFlowCsvRoundTrip(unittest.TestCase):
 
     def flow_args(self, **overrides):
         args = {"csv": self.source, "playlist_id": None, "arc": "party",
-                "out": None, "tag_prompt": False}
+                "out": None, "tag_prompt": False, "apply": False,
+                "in_place": False}
         args.update(overrides)
         return argparse.Namespace(**args)
 
@@ -218,7 +219,7 @@ class TestTaggingPrompt(unittest.TestCase):
         out = os.path.join(self.tmp, "tagging.txt")
         kimbo.cmd_flow(argparse.Namespace(
             csv=self.source, playlist_id=None, arc="party", out=out,
-            tag_prompt=True))
+            tag_prompt=True, apply=False, in_place=False))
         with open(out, encoding="utf-8") as f:
             text = f.read()
         self.assertIn("Energy column", text)
@@ -233,10 +234,48 @@ class TestTaggingPrompt(unittest.TestCase):
             writer.writerow(["Golden Hour", "June & the Latches", "Porch Light"])
         out = os.path.join(self.tmp, "bare-tagging.txt")
         kimbo.cmd_flow(argparse.Namespace(
-            csv=bare, playlist_id=None, arc="party", out=out, tag_prompt=True))
+            csv=bare, playlist_id=None, arc="party", out=out, tag_prompt=True,
+            apply=False, in_place=False))
         with open(out, encoding="utf-8") as f:
             header = f.read().split("\n\n", 1)[1].splitlines()[0]
         self.assertTrue(header.endswith("Energy,Vibe"), header)
+
+
+class TestBpmCache(unittest.TestCase):
+    """Lookups we already paid for, kept between runs."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "nested", "cache.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_round_trip(self):
+        kimbo.save_bpm_cache({"sixteen tons|merle travis": [88, "Cm"]},
+                             path=self.path)
+        self.assertEqual(kimbo.load_bpm_cache(path=self.path),
+                         {"sixteen tons|merle travis": [88, "Cm"]})
+
+    def test_missing_cache_is_empty_not_fatal(self):
+        self.assertEqual(kimbo.load_bpm_cache(path=self.path + ".nope"), {})
+
+    def test_corrupt_cache_is_empty_not_fatal(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(kimbo.load_bpm_cache(path=self.path), {})
+
+
+class TestSlugify(unittest.TestCase):
+    """Playlist names become filenames."""
+
+    def test_spaces_and_punctuation(self):
+        self.assertEqual(kimbo.slugify("Garden Party!"), "garden-party")
+        self.assertEqual(kimbo.slugify("Kimbo's 2nd Mix"), "kimbos-2nd-mix")
+
+    def test_unusable_name_still_gives_a_filename(self):
+        self.assertEqual(kimbo.slugify("!!!"), "playlist")
 
 
 if __name__ == "__main__":

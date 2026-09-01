@@ -17,6 +17,7 @@ environment variables; see .env.example.
 
 import argparse
 import csv
+import json
 import math
 import os
 import re
@@ -373,6 +374,77 @@ def getsongbpm_lookup(session, api_key, title, artist):
     return (tempo, key, "getsongbpm") if tempo or key else None
 
 
+BPM_CACHE_PATH = os.path.expanduser("~/.cache/kimbo/getsongbpm-cache.json")
+
+
+def load_bpm_cache(path=None):
+    """Remembered lookups: {"title|artist": [tempo, key]}.
+
+    Grown one real playlist at a time - which is the honest version of
+    "just scrape every song ever"."""
+    try:
+        with open(path or BPM_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+def save_bpm_cache(cache, path=None):
+    """Best effort - a cache we cannot write is not worth failing a run for."""
+    path = path or BPM_CACHE_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except (IOError, OSError) as exc:
+        warn("could not write %s: %s" % (path, exc))
+
+
+def getsongbpm_notice(api_key):
+    """The credit GetSongBPM's terms require, or the nudge to get a key."""
+    if not api_key:
+        warn("GETSONGBPM_KEY not set - only Spotify-side data was attempted. "
+             "Free key at getsongbpm.com/api")
+    else:
+        print("Note: GetSongBPM's terms require a visible link back to "
+              "getsongbpm.com wherever you publish their data.")
+
+
+def gather_tempo_key(sp, rows3, ids):
+    """(tempo, key, source) per row, aligned with rows3.
+
+    Spotify's own features first for grandfathered apps, then the local
+    cache, then a GetSongBPM lookup."""
+    by_id = {}
+    if ids and sp:
+        by_id = spotify_features(sp, ids)
+
+    api_key = os.environ.get("GETSONGBPM_KEY")
+    cache = load_bpm_cache() if api_key else {}
+    session = requests.Session()
+    found, learned = [], False
+    for i, (title, artist, album) in enumerate(rows3):
+        tempo, key, source = "", "", ""
+        if ids and i < len(ids) and ids[i] in by_id:
+            tempo, key, source = by_id[ids[i]]
+        elif api_key:
+            slot = ("%s|%s" % (title, artist)).lower()
+            if slot in cache:
+                tempo, key, source = cache[slot][0], cache[slot][1], "cache"
+            else:
+                hit = getsongbpm_lookup(session, api_key, title, artist)
+                if hit:
+                    tempo, key, source = hit
+                    cache[slot], learned = [tempo, key], True
+                time.sleep(0.6)          # be polite; free tier rate-limits
+        found.append((tempo, key, source))
+        print("  %-7s %-4s %s - %s" % (tempo or "-", key or "-", artist, title))
+    if learned:
+        save_bpm_cache(cache)
+    return found
+
+
 def cmd_enrich(args):
     if not args.csv and not args.playlist_id:
         die("pass --csv or --playlist-id")
@@ -384,24 +456,9 @@ def cmd_enrich(args):
         rows3 = [(t, a, "") for t, a in read_rows(args.csv)]
         ids = []
 
-    by_id = {}
-    if ids and sp:
-        by_id = spotify_features(sp, ids)
-
-    api_key = os.environ.get("GETSONGBPM_KEY")
-    session = requests.Session()
-    out_rows = []
-    for i, (title, artist, album) in enumerate(rows3):
-        tempo, key, source = "", "", ""
-        if ids and i < len(ids) and ids[i] in by_id:
-            tempo, key, source = by_id[ids[i]]
-        elif api_key:
-            hit = getsongbpm_lookup(session, api_key, title, artist)
-            if hit:
-                tempo, key, source = hit
-            time.sleep(0.6)          # be polite; free tier rate-limits
-        out_rows.append([title, artist, album, tempo, key, source])
-        print("  %-7s %-4s %s - %s" % (tempo or "-", key or "-", artist, title))
+    out_rows = [[title, artist, album, tempo, key, source]
+                for (title, artist, album), (tempo, key, source)
+                in zip(rows3, gather_tempo_key(sp, rows3, ids))]
 
     out = args.out or ((args.csv or "playlist").rsplit(".csv", 1)[0] + "-enriched.csv")
     with open(out, "w", newline="", encoding="utf-8") as f:
@@ -410,12 +467,7 @@ def cmd_enrich(args):
         writer.writerows(out_rows)
     filled = sum(1 for r in out_rows if r[3] or r[4])
     print("\nWrote %s (%d/%d rows enriched)." % (out, filled, len(out_rows)))
-    if not api_key:
-        warn("GETSONGBPM_KEY not set - only Spotify-side data was attempted. "
-             "Free key at getsongbpm.com/api")
-    else:
-        print("Note: GetSongBPM's terms require a visible link back to "
-              "getsongbpm.com wherever you publish their data.")
+    getsongbpm_notice(os.environ.get("GETSONGBPM_KEY"))
 
 
 
@@ -767,13 +819,87 @@ def write_tagging_prompt(source, out):
             writer.writerow(row + [""] * (len(head) - len(row)))
 
 
+def slugify(name):
+    """'Garden Party!' -> 'garden-party', for use in a filename."""
+    slug = "".join(c for c in name.lower().replace(" ", "-")
+                   if c.isalnum() or c in "-_")
+    return slug.strip("-") or "playlist"
+
+
+def add_in_batches(sp, playlist_id, track_ids):
+    """Spotify takes 100 items per call."""
+    for start in range(0, len(track_ids), 100):
+        sp.playlist_add_items(playlist_id, track_ids[start:start + 100])
+
+
+def flow_write_back(sp, args, name, tracks, order):
+    """Push the new order to Spotify - only when explicitly asked."""
+    ordered_ids = [tracks[i]["spotify_id"] for i in order
+                   if tracks[i].get("spotify_id")]
+    dropped = len(order) - len(ordered_ids)
+    if args.apply:
+        new_name = "%s (flow)" % name
+        new_id = sp.user_playlist_create(
+            sp.me()["id"], new_name, public=False,
+            description="kimbo flow: %s arc" % args.arc)["id"]
+        add_in_batches(sp, new_id, ordered_ids)
+        if dropped:
+            warn("%d track(s) had no Spotify id and were left out" % dropped)
+        print("Created private playlist '%s' with %d tracks."
+              % (new_name, len(ordered_ids)))
+        print("Playlist: https://open.spotify.com/playlist/" + new_id)
+        return
+
+    # --in-place overwrites the playlist and Spotify keeps no undo, so the
+    # original order goes to disk before anything is touched.
+    backup = slugify(name) + "-before-flow.csv"
+    try:
+        write_flow_csv(backup, tracks, list(range(len(tracks))))
+    except (IOError, OSError) as exc:
+        die("could not write the backup %s (%s) - refusing to overwrite "
+            "the playlist" % (backup, exc))
+    print("Original order saved to %s" % backup)
+    if dropped:
+        warn("%d track(s) have no Spotify id and will be dropped" % dropped)
+    sp.playlist_replace_items(args.playlist_id, ordered_ids[:100])
+    add_in_batches(sp, args.playlist_id, ordered_ids[100:])
+    print("Reordered '%s' in place (%d tracks)." % (name, len(ordered_ids)))
+    print("Playlist: https://open.spotify.com/playlist/" + args.playlist_id)
+
+
+def flow_from_playlist(args):
+    """Pull a playlist, look up tempo and key, return (name, tracks, sp)."""
+    sp = spotify_client()
+    rows3 = playlist_rows(sp, args.playlist_id)
+    ids = playlist_track_ids(sp, args.playlist_id)
+    name = sp.playlist(args.playlist_id)["name"]
+    if not rows3:
+        die("playlist '%s' has no tracks" % name)
+    print("Reading tempo and key for %d tracks in '%s'..." % (len(rows3), name))
+    found = gather_tempo_key(sp, rows3, ids)
+    getsongbpm_notice(os.environ.get("GETSONGBPM_KEY"))
+
+    tracks = []
+    for i, ((title, artist, album), (tempo, key, source)) in enumerate(zip(rows3, found)):
+        tracks.append({"title": title, "artist": artist, "album": album,
+                       "tempo": _flow_float(tempo), "key": key or "",
+                       "camelot": to_camelot(key), "energy": None, "vibe": "",
+                       "source": source,
+                       "spotify_id": ids[i] if i < len(ids) else None})
+    print("\nNo Energy column here, so tempo stands in for how a track feels.")
+    print("For vibe-aware ordering: export, enrich, flow --tag-prompt, then flow.")
+    return sp, name, tracks
+
+
 def cmd_flow(args):
     if bool(args.csv) == bool(args.playlist_id):
         die("pass exactly one of --csv or --playlist-id")
     if args.tag_prompt and args.playlist_id:
         die("--tag-prompt needs a CSV - run `export` then `enrich` first")
-    if args.playlist_id:
-        die("playlist mode arrives in a later phase")
+    if args.apply and args.in_place:
+        die("pass --apply or --in-place, not both")
+    if args.csv and (args.apply or args.in_place):
+        die("--apply and --in-place need --playlist-id")
 
     if args.tag_prompt:
         out = args.out or (args.csv.rsplit(".csv", 1)[0] + "-tagging.txt")
@@ -783,19 +909,28 @@ def cmd_flow(args):
         print("  python3 kimbo.py flow --csv <that file>")
         return
 
-    tracks = read_enriched_rows(args.csv)
-    if not tracks:
-        die("no tracks found in %s" % args.csv)
-    if not any(track["tempo"] or track["camelot"] for track in tracks):
-        warn("no tempo or key in %s - run enrich first for harmonic ordering"
-             % args.csv)
+    sp = name = None
+    if args.playlist_id:
+        sp, name, tracks = flow_from_playlist(args)
+        default_out = slugify(name) + "-flow.csv"
+    else:
+        tracks = read_enriched_rows(args.csv)
+        if not tracks:
+            die("no tracks found in %s" % args.csv)
+        if not any(track["tempo"] or track["camelot"] for track in tracks):
+            warn("no tempo or key in %s - run enrich first for harmonic "
+                 "ordering" % args.csv)
+        default_out = args.csv.rsplit(".csv", 1)[0] + "-flow.csv"
 
     order = order_tracks(tracks, args.arc)
     for line in flow_report(tracks, order, args.arc):
         print(line)
-    out = args.out or (args.csv.rsplit(".csv", 1)[0] + "-flow.csv")
+    out = args.out or default_out
     write_flow_csv(out, tracks, order)
     print("\nWrote %s (%d tracks in play order)." % (out, len(order)))
+
+    if args.apply or args.in_place:
+        flow_write_back(sp, args, name, tracks, order)
 
 
 # ------------------------------------------------------------------ setup ---
@@ -981,6 +1116,10 @@ def main():
                    help="energy curve to shape the set around (default party)")
     p.add_argument("--tag-prompt", action="store_true",
                    help="write an LLM prompt for filling in Energy/Vibe")
+    p.add_argument("--apply", action="store_true",
+                   help="create a new private '<name> (flow)' playlist")
+    p.add_argument("--in-place", action="store_true",
+                   help="overwrite the playlist itself (saves the old order first)")
     p.add_argument("--out", help="output path (default: <input>-flow.csv)")
     p.set_defaults(func=cmd_flow)
 

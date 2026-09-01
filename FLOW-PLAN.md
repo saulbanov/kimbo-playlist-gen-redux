@@ -544,7 +544,7 @@ diff against this spec.
 - [x] Phase 2 — ordering engine
 - [x] Phase 3 — CSV mode + report + fixture
 - [x] Phase 4 — tag-prompt
-- [ ] Phase 5 — playlist mode + cache
+- [x] Phase 5 — playlist mode + cache
 - [ ] Phase 6 — docs
 
 Blockers (executor: note anything that stopped you, with the failing
