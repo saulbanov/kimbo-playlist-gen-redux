@@ -545,7 +545,7 @@ diff against this spec.
 - [x] Phase 3 — CSV mode + report + fixture
 - [x] Phase 4 — tag-prompt
 - [x] Phase 5 — playlist mode + cache
-- [ ] Phase 6 — docs
+- [x] Phase 6 — docs
 
 Blockers (executor: note anything that stopped you, with the failing
 command and its output):
