@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Offline tests for kimbo's flow ordering. No network, no credentials."""
 
+import argparse
+import csv
+import os
+import shutil
+import tempfile
 import unittest
 
 import kimbo
+
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "examples", "garden-party-tagged.csv")
 
 
 def track(key, tempo, energy=None, title="Song", artist="Artist"):
@@ -132,6 +140,67 @@ class TestOrdering(unittest.TestCase):
         self.assertEqual(order, kimbo.order_tracks(tracks, "flat"))
         self.assertLess(mean_cost(tracks, order),
                         mean_cost(tracks, list(range(8))))
+
+
+class TestReadEnrichedRows(unittest.TestCase):
+    """Reading the tempo/key/energy columns `enrich` and tagging leave."""
+
+    def setUp(self):
+        self.tracks = kimbo.read_enriched_rows(FIXTURE)
+
+    def test_reads_every_row(self):
+        self.assertEqual(len(self.tracks), 12)
+
+    def test_parses_tempo_and_key(self):
+        self.assertEqual(self.tracks[1]["tempo"], 174.0)
+        self.assertEqual(self.tracks[11]["camelot"], "2A")
+
+    def test_missing_values_stay_missing(self):
+        self.assertIsNone(self.tracks[7]["tempo"])     # blank tempo
+        self.assertIsNone(self.tracks[9]["camelot"])   # blank key
+
+
+class TestFlowCsvRoundTrip(unittest.TestCase):
+    """`flow --csv` writes every track back out, reordered but intact."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.source = os.path.join(self.tmp, "garden.csv")
+        shutil.copy(FIXTURE, self.source)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def flow_args(self, **overrides):
+        args = {"csv": self.source, "playlist_id": None, "arc": "party",
+                "out": None}
+        args.update(overrides)
+        return argparse.Namespace(**args)
+
+    def test_no_track_is_lost(self):
+        out = os.path.join(self.tmp, "ordered.csv")
+        kimbo.cmd_flow(self.flow_args(out=out))
+        with open(out, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0], kimbo.FLOW_CSV_HEADER)
+        written = sorted((r[0], r[1]) for r in rows[1:])
+        expected = sorted((t["title"], t["artist"])
+                          for t in kimbo.read_enriched_rows(FIXTURE))
+        self.assertEqual(written, expected)
+
+    def test_missing_tempo_does_not_crash_the_report(self):
+        # The fixture has a blank-tempo track; bpm_gap cannot take a None.
+        tracks = kimbo.read_enriched_rows(FIXTURE)
+        order = kimbo.order_tracks(tracks, "party")
+        lines = kimbo.flow_report(tracks, order, "party")
+        self.assertTrue(any("tempo ?" in line for line in lines))
+
+    def test_half_double_time_reads_as_smooth(self):
+        fast = track("Em", 174)
+        slow = track("Em", 87)
+        note, smooth, _ = kimbo.join_quality(fast, slow)
+        self.assertTrue(smooth)
+        self.assertIn("half/double-time", note)
 
 
 if __name__ == "__main__":

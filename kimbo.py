@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """kimbo - playlist plumbing for Spotify.
 
-Redux of the old playlist-generator script. Five subcommands:
+Redux of the old playlist-generator script. Six subcommands:
 
   setup     guided walkthrough: get every credential, store and test them
   import    CSV -> Spotify playlist (ordered, deduped, reports misses)
@@ -9,6 +9,7 @@ Redux of the old playlist-generator script. Five subcommands:
   discover  Genius lyric-density search -> a candidates playlist or CSV
   enrich    add tempo/key columns via GetSongBPM (and Spotify
             audio-features, when your app still has access)
+  flow      reorder by key/tempo/energy so the playlist plays smoothly
 
 Run `python3 kimbo.py <command> -h` for options. Credentials come from
 environment variables; see .env.example.
@@ -461,6 +462,9 @@ ARC_BREAKPOINTS = {
     "build":  [(0.0, 1.5), (1.0, 5.0)],               # straight climb (workout)
 }
 
+FLOW_CSV_HEADER = CSV_HEADER + ["Tempo", "Key", "Camelot", "Energy",
+                                "Vibe", "Source"]
+
 
 def normalize_key(raw):
     """('A#', True) for 'Bbm'. None when missing or unparseable.
@@ -611,6 +615,143 @@ def order_tracks(tracks, arc):
         order.append(best)
         used.add(best)
     return order
+
+def _flow_float(text):
+    """'98' -> 98.0; blank or junk -> None. Missing data stays missing."""
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _flow_num(value):
+    """98.0 -> '98', None -> ''."""
+    return "" if value is None else "%g" % value
+
+
+def read_enriched_rows(path):
+    """Track dicts from a CSV.
+
+    Everything past title and artist is optional: a plain two-column list
+    reads fine, it just has nothing to order by until `enrich` has run."""
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        die("%s is empty" % path)
+    header = [c.strip().lower() for c in rows[0]]
+    if "track name" in header:
+        index = dict((name, i) for i, name in enumerate(header))
+        body = rows[1:]
+    else:
+        index = {"track name": 0, "artist name": 1}
+        body = rows                      # headerless: row 1 is a track
+    tracks = []
+    for row in body:
+        cell = lambda name: (row[index[name]].strip()
+                             if name in index and index[name] < len(row) else "")
+        title = cell("track name")
+        if not title:
+            continue
+        key = cell("key")
+        tracks.append({"title": title, "artist": cell("artist name"),
+                       "album": cell("album"), "tempo": _flow_float(cell("tempo")),
+                       "key": key, "camelot": to_camelot(key),
+                       "energy": _flow_float(cell("energy")),
+                       "vibe": cell("vibe"), "source": cell("source")})
+    return tracks
+
+
+def join_quality(prev, cand):
+    """(note, smooth, comparable) for the join from prev into cand.
+
+    Missing data is checked first and reported as '?' rather than guessed:
+    bpm_gap does arithmetic on both tempos and cannot take a None."""
+    have_key = bool(prev["camelot"] and cand["camelot"])
+    have_tempo = bool(prev["tempo"] and cand["tempo"]
+                      and prev["tempo"] > 0 and cand["tempo"] > 0)
+    key_ok = (have_key and
+              key_penalty(prev["camelot"], cand["camelot"]) <= FLOW_SMOOTH_KEY)
+    tempo_ok, ratio = False, 1.0
+    if have_tempo:
+        distance, ratio = bpm_gap(prev["tempo"], cand["tempo"])
+        tempo_ok = distance <= FLOW_SMOOTH_BPM
+    if have_key and have_tempo and key_ok and tempo_ok:
+        return ("smooth (half/double-time)" if ratio != 1.0 else "smooth",
+                True, True)
+    problems = []
+    problems.append("key ?" if not have_key else ("key jump" if not key_ok else ""))
+    problems.append("tempo ?" if not have_tempo
+                    else ("tempo jump" if not tempo_ok else ""))
+    return ", ".join(p for p in problems if p), False, have_key and have_tempo
+
+
+def rough_transitions(tracks, order):
+    """How many joins are bumpy among those we can actually judge."""
+    rough = 0
+    for before, after in zip(order, order[1:]):
+        _, smooth, comparable = join_quality(tracks[before], tracks[after])
+        if comparable and not smooth:
+            rough += 1
+    return rough
+
+
+def flow_report(tracks, order, arc):
+    """Printable lines: the play order, and how each join sounds."""
+    lines = ["Flow order (arc: %s):" % arc]
+    smooth_total = 0
+    for slot, i in enumerate(order):
+        track, note = tracks[i], ""
+        if slot:
+            note, smooth, _ = join_quality(tracks[order[slot - 1]], track)
+            smooth_total += 1 if smooth else 0
+        label = "%s - %s" % (track["artist"], track["title"])
+        if len(label) > 38:
+            label = label[:35] + "..."
+        lines.append("  %3d. %-38s %5s %-4s %-4s %-3s %s"
+                     % (slot + 1, label, _flow_num(track["tempo"]) or "-",
+                        track["key"] or "-", track["camelot"] or "-",
+                        _flow_num(track["energy"]) or "-", note))
+    lines.append("")
+    lines.append("Transitions: %d total, %d smooth"
+                 % (max(len(order) - 1, 0), smooth_total))
+    lines.append("Rough transitions: input order %d -> flow order %d"
+                 % (rough_transitions(tracks, list(range(len(tracks)))),
+                    rough_transitions(tracks, order)))
+    return lines
+
+
+def write_flow_csv(path, tracks, order):
+    """The reordered list, ready to hand back to `import`."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(FLOW_CSV_HEADER)
+        for i in order:
+            track = tracks[i]
+            writer.writerow([track["title"], track["artist"], track["album"],
+                             _flow_num(track["tempo"]), track["key"],
+                             track["camelot"] or "", _flow_num(track["energy"]),
+                             track["vibe"], track["source"]])
+
+
+def cmd_flow(args):
+    if bool(args.csv) == bool(args.playlist_id):
+        die("pass exactly one of --csv or --playlist-id")
+    if args.playlist_id:
+        die("playlist mode arrives in a later phase")
+
+    tracks = read_enriched_rows(args.csv)
+    if not tracks:
+        die("no tracks found in %s" % args.csv)
+    if not any(track["tempo"] or track["camelot"] for track in tracks):
+        warn("no tempo or key in %s - run enrich first for harmonic ordering"
+             % args.csv)
+
+    order = order_tracks(tracks, args.arc)
+    for line in flow_report(tracks, order, args.arc):
+        print(line)
+    out = args.out or (args.csv.rsplit(".csv", 1)[0] + "-flow.csv")
+    write_flow_csv(out, tracks, order)
+    print("\nWrote %s (%d tracks in play order)." % (out, len(order)))
 
 
 # ------------------------------------------------------------------ setup ---
@@ -787,6 +928,15 @@ def main():
     p.add_argument("--playlist-id")
     p.add_argument("--out")
     p.set_defaults(func=cmd_enrich)
+
+    p = sub.add_parser("flow", help="reorder so the playlist plays smoothly")
+    p.add_argument("--csv", help="an enriched CSV (see `enrich`)")
+    p.add_argument("--playlist-id", help="reorder a playlist you own")
+    p.add_argument("--arc", default="party",
+                   choices=["flat", "steady", "party", "chill", "build"],
+                   help="energy curve to shape the set around (default party)")
+    p.add_argument("--out", help="output path (default: <input>-flow.csv)")
+    p.set_defaults(func=cmd_flow)
 
     load_env_file()
     args = parser.parse_args()

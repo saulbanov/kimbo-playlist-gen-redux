@@ -542,7 +542,7 @@ diff against this spec.
 
 - [x] Phase 1 — camelot + compatibility math
 - [x] Phase 2 — ordering engine
-- [ ] Phase 3 — CSV mode + report + fixture
+- [x] Phase 3 — CSV mode + report + fixture
 - [ ] Phase 4 — tag-prompt
 - [ ] Phase 5 — playlist mode + cache
 - [ ] Phase 6 — docs

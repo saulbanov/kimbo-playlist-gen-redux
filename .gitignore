@@ -4,3 +4,5 @@ __pycache__/
 cache.txt
 .cache/
 *-enriched.csv
+*-flow.csv
+*-tagging.txt
