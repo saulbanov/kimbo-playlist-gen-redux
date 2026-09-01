@@ -14,12 +14,16 @@ Discovery is the part no app does. You give it a phrase, and it searches a lyric
 
 ### Setup
 
-1. `pip3 install -r requirements.txt` (Python 3.8+; installs spotipy, lyricsgenius, requests).
-2. Create a Spotify app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard). Set the redirect URI to `http://127.0.0.1:8888/callback` **in the app settings** — Spotify rejects `localhost` for new apps; it must be HTTPS or the `127.0.0.1` loopback.
-3. `cp .env.example .env`, fill it in, then load it: `export $(grep -v '^#' .env | xargs)`.
-4. First run opens a browser for OAuth; the token caches at `~/.cache/kimbo/spotify-token`.
+```
+pip3 install -r requirements.txt
+python3 kimbo.py setup
+```
 
-`GENIUS_TOKEN` is only needed for `discover` (free at genius.com/api-clients). `GETSONGBPM_KEY` only for `enrich` (free at getsongbpm.com/api).
+`setup` is a guided walkthrough: it takes you step by step through creating the Spotify app (including the exact redirect-URI rule Spotify now enforces), the Genius token, and the GetSongBPM key, writes them to a git-ignored `.env`, and tests each one on the spot. Enter skips the optional ones — Genius is only for `discover`, GetSongBPM only for `enrich`. kimbo loads `.env` automatically on every run, so there is nothing to export.
+
+Re-run `python3 kimbo.py setup` any time to change a value (Enter keeps what's there), or `python3 kimbo.py setup --check` to just validate what's configured. The first real command opens a browser once for Spotify OAuth; the token caches at `~/.cache/kimbo/spotify-token`.
+
+Manual fallback: copy `.env.example` to `.env` and fill it in yourself — the file documents each variable.
 
 ### Commands
 
@@ -33,7 +37,7 @@ python3 kimbo.py enrich   --csv list.csv                # writes list-enriched.c
 python3 kimbo.py enrich   --playlist-id 3cEYpjA9...     # tempo/key for a live playlist
 ```
 
-Useful flags: `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages).
+Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages).
 
 ### CSV format
 

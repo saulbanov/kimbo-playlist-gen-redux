@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """kimbo - playlist plumbing for Spotify.
 
-Redux of the old playlist-generator script. Four subcommands:
+Redux of the old playlist-generator script. Five subcommands:
 
+  setup     guided walkthrough: get every credential, store and test them
   import    CSV -> Spotify playlist (ordered, deduped, reports misses)
   export    Spotify playlist -> CSV in the same format
   discover  Genius lyric-density search -> a candidates playlist or CSV
@@ -52,8 +53,9 @@ def spotify_client():
         die("spotipy not installed: pip3 install -r requirements.txt")
     for var in ("SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI"):
         if not os.environ.get(var):
-            die("%s is not set - copy .env.example to .env, fill it in, and "
-                "`export $(grep -v '^#' .env | xargs)` (or use direnv)" % var)
+            die("%s is not set - run `python3 kimbo.py setup` for a guided "
+                "walkthrough (or copy .env.example to .env and fill it in; "
+                ".env is loaded automatically)" % var)
     cache = os.path.expanduser("~/.cache/kimbo/spotify-token")
     os.makedirs(os.path.dirname(cache), exist_ok=True)
     scope = "playlist-modify-public playlist-modify-private playlist-read-private"
@@ -239,7 +241,8 @@ def density(lyrics, terms):
 def genius_client():
     token = os.environ.get("GENIUS_TOKEN")
     if not token:
-        die("GENIUS_TOKEN is not set (free at genius.com/api-clients)")
+        die("GENIUS_TOKEN is not set - run `python3 kimbo.py setup` "
+            "(free token at genius.com/api-clients)")
     try:
         import lyricsgenius
     except ImportError:
@@ -413,12 +416,145 @@ def cmd_enrich(args):
               "getsongbpm.com wherever you publish their data.")
 
 
+
+# ------------------------------------------------------------------ setup ---
+
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+ENV_TEMPLATE = """# kimbo credentials - written by `python3 kimbo.py setup`. Git-ignored.
+SPOTIPY_CLIENT_ID=%(SPOTIPY_CLIENT_ID)s
+SPOTIPY_CLIENT_SECRET=%(SPOTIPY_CLIENT_SECRET)s
+SPOTIPY_REDIRECT_URI=%(SPOTIPY_REDIRECT_URI)s
+GENIUS_TOKEN=%(GENIUS_TOKEN)s
+GETSONGBPM_KEY=%(GETSONGBPM_KEY)s
+"""
+
+ENV_VARS = ["SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI",
+            "GENIUS_TOKEN", "GETSONGBPM_KEY"]
+
+
+def load_env_file():
+    """Load .env sitting next to this script. Never overrides real env."""
+    if not os.path.exists(ENV_PATH):
+        return
+    with open(ENV_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                if value.strip():
+                    os.environ.setdefault(key.strip(), value.strip())
+
+
+def _masked(value):
+    return (value[:4] + "..." + value[-2:]) if value and len(value) > 8 else            ("(set)" if value else "(not set)")
+
+
+def _ask(label, current):
+    got = input("  %s [%s]: " % (label, _masked(current))).strip()
+    return got or current
+
+
+def _check_genius(token):
+    try:
+        response = requests.get("https://api.genius.com/search",
+                                params={"q": "test"}, timeout=15,
+                                headers={"Authorization": "Bearer " + token})
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _check_getsongbpm(key):
+    try:
+        response = requests.get("https://api.getsong.co/search/", timeout=15,
+                                params={"api_key": key, "type": "song", "lookup": "sixteen tons"})
+        data = response.json()
+        return response.status_code == 200 and isinstance(data.get("search"), list)
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def _validate(values, try_spotify):
+    print("\nChecking what's configured...")
+    if values["GENIUS_TOKEN"]:
+        print("  Genius token:    %s" % ("OK" if _check_genius(values["GENIUS_TOKEN"]) else "FAILED - recheck it"))
+    else:
+        print("  Genius token:    skipped (only needed for `discover`)")
+    if values["GETSONGBPM_KEY"]:
+        print("  GetSongBPM key:  %s" % ("OK" if _check_getsongbpm(values["GETSONGBPM_KEY"]) else "FAILED - recheck it"))
+    else:
+        print("  GetSongBPM key:  skipped (only needed for `enrich`)")
+    if not (values["SPOTIPY_CLIENT_ID"] and values["SPOTIPY_CLIENT_SECRET"]):
+        print("  Spotify:         NOT CONFIGURED - every command needs it")
+        return
+    if try_spotify and input("  Test Spotify auth now? Opens a browser once. [y/N]: ").strip().lower() == "y":
+        try:
+            me = spotify_client().me()
+            print("  Spotify:         OK - authenticated as %s" % (me.get("display_name") or me["id"]))
+        except Exception as exc:
+            print("  Spotify:         FAILED - %s" % exc)
+            print("    Most common cause: the redirect URI in your app settings does not")
+            print("    EXACTLY match %s" % values["SPOTIPY_REDIRECT_URI"])
+    else:
+        print("  Spotify:         credentials present (auth tested on first real command)")
+
+
+def cmd_setup(args):
+    values = {var: os.environ.get(var, "") for var in ENV_VARS}
+    if not values["SPOTIPY_REDIRECT_URI"]:
+        values["SPOTIPY_REDIRECT_URI"] = "http://127.0.0.1:8888/callback"
+
+    if args.check:
+        _validate(values, try_spotify=True)
+        return
+
+    print("kimbo setup - three credentials, ~5 minutes. Enter keeps the current value.\n")
+
+    print("STEP 1 of 3 - Spotify (required: every command talks to your account)")
+    print("  1. Open https://developer.spotify.com/dashboard and log in with your normal Spotify account")
+    print("  2. 'Create app' - name and description can be anything (e.g. kimbo)")
+    print("  3. Redirect URI: enter EXACTLY  http://127.0.0.1:8888/callback  and click Add.")
+    print("     Spotify rejects 'localhost' for new apps - it must be this loopback form or HTTPS.")
+    print("  4. Tick 'Web API', save, then open the app's Settings")
+    print("  5. Copy the Client ID, then 'View client secret' and copy that too\n")
+    values["SPOTIPY_CLIENT_ID"] = _ask("Client ID", values["SPOTIPY_CLIENT_ID"])
+    values["SPOTIPY_CLIENT_SECRET"] = _ask("Client Secret", values["SPOTIPY_CLIENT_SECRET"])
+    values["SPOTIPY_REDIRECT_URI"] = _ask("Redirect URI", values["SPOTIPY_REDIRECT_URI"])
+
+    print("\nSTEP 2 of 3 - Genius (only for `discover`; press Enter to skip)")
+    print("  1. Open https://genius.com/api-clients and sign in (free account)")
+    print("  2. 'New API Client' - app name anything; app website can be https://example.com")
+    print("  3. Copy the CLIENT ACCESS TOKEN (the long one - not the ID or secret)\n")
+    values["GENIUS_TOKEN"] = _ask("Genius client access token", values["GENIUS_TOKEN"])
+
+    print("\nSTEP 3 of 3 - GetSongBPM (only for `enrich`; press Enter to skip)")
+    print("  1. Open https://getsongbpm.com/api and register - the key arrives by email")
+    print("  2. Their terms require a visible link back to getsongbpm.com wherever")
+    print("     you publish their tempo/key data\n")
+    values["GETSONGBPM_KEY"] = _ask("GetSongBPM API key", values["GETSONGBPM_KEY"])
+
+    with open(ENV_PATH, "w", encoding="utf-8") as f:
+        f.write(ENV_TEMPLATE % values)
+    os.chmod(ENV_PATH, 0o600)
+    for var in ENV_VARS:                      # make new values live for validation
+        if values[var]:
+            os.environ[var] = values[var]
+    print("\nWrote %s (git-ignored; loaded automatically on every run)." % ENV_PATH)
+    _validate(values, try_spotify=True)
+    print("\nDone. Try: python3 kimbo.py import --csv examples/oil-anti-canon.csv --dry-run")
+
+
 # -------------------------------------------------------------------- CLI ---
 
 def main():
     parser = argparse.ArgumentParser(prog="kimbo", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("setup", help="guided walkthrough: get and store all credentials")
+    p.add_argument("--check", action="store_true", help="validate existing credentials, no prompts")
+    p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("import", help="CSV -> Spotify playlist, order preserved")
     p.add_argument("--csv", required=True)
@@ -456,6 +592,7 @@ def main():
     p.add_argument("--out")
     p.set_defaults(func=cmd_enrich)
 
+    load_env_file()
     args = parser.parse_args()
     args.func(args)
 
