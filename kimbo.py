@@ -449,6 +449,18 @@ FLOW_UNKNOWN_PEN = 0.3   # neutral penalty when key or tempo is unknown
 FLOW_SMOOTH_KEY = 0.25   # max key penalty still called "smooth"
 FLOW_SMOOTH_BPM = 0.09   # max tempo log2-distance still called "smooth" (~6%)
 
+# Energy curve per arc as (position 0..1, energy 1..5) breakpoints, linearly
+# interpolated. The arc is the part you pick per occasion; the key and tempo
+# math below is the same either way.
+ARC_BREAKPOINTS = {
+    "flat":   None,                                   # no arc: pure key/tempo chaining
+    "steady": [(0.0, 3.0), (1.0, 3.0)],               # hold one level (bike ride)
+    "party":  [(0.0, 2.0), (0.15, 3.0), (0.7, 5.0),   # warm up, build, peak,
+               (0.85, 5.0), (1.0, 2.5)],              # wind down
+    "chill":  [(0.0, 3.5), (1.0, 1.5)],               # gentle descent
+    "build":  [(0.0, 1.5), (1.0, 5.0)],               # straight climb (workout)
+}
+
 
 def normalize_key(raw):
     """('A#', True) for 'Bbm'. None when missing or unparseable.
@@ -524,6 +536,81 @@ def bpm_penalty(tempo_a, tempo_b):
     if not tempo_a or not tempo_b or tempo_a <= 0 or tempo_b <= 0:
         return FLOW_UNKNOWN_PEN
     return min(1.0, bpm_gap(tempo_a, tempo_b)[0] / 0.5)
+
+def arc_targets(name, n):
+    """Target energy for each of n slots, or n Nones for the 'flat' arc."""
+    breakpoints = ARC_BREAKPOINTS[name]
+    if breakpoints is None:
+        return [None] * n
+    targets = []
+    for i in range(n):
+        position = 0.0 if n == 1 else float(i) / (n - 1)
+        energy = breakpoints[-1][1]           # past the end: hold the last
+        for (pos_a, energy_a), (pos_b, energy_b) in zip(breakpoints, breakpoints[1:]):
+            if position <= pos_b:
+                frac = 0.0 if pos_b == pos_a else (position - pos_a) / (pos_b - pos_a)
+                energy = energy_a + (energy_b - energy_a) * frac
+                break
+        targets.append(energy)
+    return targets
+
+
+def effective_energies(tracks):
+    """Per-track energy on a 1-5 scale.
+
+    A tagged Energy column always wins. Without one we fall back to a crude
+    tempo rank, which is exactly the judgment tempo cannot make: a delicate
+    155 BPM piano piece reads as high energy here and is not."""
+    n = len(tracks)
+    if any(track.get("energy") is not None for track in tracks):
+        return [float(min(5.0, max(1.0, track["energy"])))
+                if track.get("energy") is not None else 3.0 for track in tracks]
+    known = [i for i in range(n) if tracks[i].get("tempo")]
+    if not known:
+        return [3.0] * n
+    energies = [3.0] * n
+    for rank, i in enumerate(sorted(known, key=lambda i: (tracks[i]["tempo"], i))):
+        energies[i] = (3.0 if len(known) == 1
+                       else 1.0 + 4.0 * rank / (len(known) - 1))
+    return energies
+
+
+def transition_cost(prev, cand, cand_energy, slot_target):
+    """What it costs to play cand straight after prev in this arc slot."""
+    cost = FLOW_W_KEY * key_penalty(prev["camelot"], cand["camelot"])
+    cost += FLOW_W_BPM * bpm_penalty(prev["tempo"], cand["tempo"])
+    if slot_target is not None:
+        cost += FLOW_W_ARC * abs(cand_energy - slot_target) / 4.0
+    return cost
+
+
+def order_tracks(tracks, arc):
+    """Input indices in play order.
+
+    Greedy: from each track take the cheapest next one. Not optimal - that
+    is a travelling-salesman problem - but deterministic and good enough to
+    hear. Ties go to the lowest index."""
+    n = len(tracks)
+    if n <= 1:
+        return list(range(n))
+    targets = arc_targets(arc, n)
+    energies = effective_energies(tracks)
+    if arc == "flat":
+        start = 0                              # keep the opener the user chose
+    else:
+        start = min(range(n), key=lambda i: (abs(energies[i] - targets[0]), i))
+    order, used = [start], set([start])
+    for slot in range(1, n):
+        prev, best, best_cost = tracks[order[-1]], None, None
+        for i in range(n):
+            if i in used:
+                continue
+            cost = transition_cost(prev, tracks[i], energies[i], targets[slot])
+            if best_cost is None or cost < best_cost - 1e-9:
+                best, best_cost = i, cost
+        order.append(best)
+        used.add(best)
+    return order
 
 
 # ------------------------------------------------------------------ setup ---
