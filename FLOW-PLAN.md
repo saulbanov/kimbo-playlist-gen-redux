@@ -88,6 +88,13 @@ optionally push the new order back to Spotify.
 
 ## Part II — Execution plan (for the autonomous executor)
 
+Every numeric expectation in this plan (the Camelot table, both penalty
+functions, the arc interpolation values, the 3-track and 8-track orderings,
+and the mean-cost comparison) was produced by running a reference
+implementation of these specs, not written from memory. Where a value here
+disagrees with your implementation, the value is right and the
+implementation is wrong.
+
 ### Executor contract — read first, obey throughout
 
 1. Work on branch `claude/playlist-flow-scope-uocufp` only.
@@ -104,9 +111,13 @@ optionally push the new order back to Spotify.
    `find_track`, or any Spotify helper except where a phase explicitly says
    so. Do not reformat existing code.
 5. Match house style: 4-space indent, `%`-style string formatting (no
-   f-strings — the file uses `%` throughout), ASCII only in source files,
-   section banner comments like
+   f-strings — the file uses `%` throughout), section banner comments like
    `# ------------------------------------------------------------- flow ---`.
+   Keep source files pure ASCII. The two musical accidentals must therefore
+   be written as escapes, never as literal glyphs: `"\u266f"` is the sharp
+   sign, `"\u266d"` the flat sign. This holds in `kimbo.py` and in
+   `test_flow.py` (so the sharp-sign test case below is written
+   `to_camelot("A\u266fm")`).
 6. New code lives in `kimbo.py` (new `flow` section placed between the
    `enrich` section and the `setup` section) and in a new `test_flow.py` at
    repo root. Constants go at the top of the flow section.
@@ -160,7 +171,8 @@ FLOW_SMOOTH_BPM = 0.09   # max tempo log2-distance still called "smooth" (~6%)
 
 `normalize_key(raw)` → `(root, is_minor)` or `None`.
 - `None`, empty, or `"?"` after stripping → `None`.
-- Replace unicode `♯`→`#`, `♭`→`b`; strip whitespace.
+- Replace `"\u266f"` (sharp) with `#` and `"\u266d"` (flat) with `b`; strip
+  whitespace.
 - Case-insensitively strip a trailing `minor`/`min`/`m` (try longest first,
   in that order) → `is_minor=True`; else strip trailing `major`/`maj` →
   `is_minor=False`. Strip whitespace again after removing the suffix (so
@@ -196,7 +208,7 @@ Create `test_flow.py` (stdlib `unittest`, `import kimbo`) asserting exactly:
 | `to_camelot("F#")` | `"2B"` |
 | `to_camelot("Db")` | `"3B"` |
 | `to_camelot("bb")` | `"6B"` |
-| `to_camelot("A♯m")` | `"3A"` |
+| `to_camelot("A\u266fm")` | `"3A"` |
 | `to_camelot("E minor")` | `"9A"` |
 | `to_camelot("")`, `to_camelot("?")`, `to_camelot(None)`, `to_camelot("H")` | `None` |
 | `key_penalty("8A", "8A")` | `0.0` |
@@ -210,10 +222,17 @@ Create `test_flow.py` (stdlib `unittest`, `import kimbo`) asserting exactly:
 | `bpm_penalty(174, 87)` and `bpm_penalty(87, 174)` | `0.0` |
 | `round(bpm_penalty(100, 106), 3)` | `0.168` |
 | `bpm_penalty(None, 120)` | `0.3` |
-| `bpm_gap(174, 87)[1]` | `0.5` |
+| `bpm_gap(174, 87)[1]` | `2.0` |
+| `bpm_gap(87, 174)[1]` | `0.5` |
 
 Use `assertAlmostEqual(..., places=6)` for the float comparisons marked
 approx.
+
+Note the direction of those last two — the ratio scales the *second*
+argument: from 174 down to 87 the match is `87 * 2.0 / 174 == 1`, so the
+ratio is `2.0`; the reverse pair gives `0.5`. Both have distance `0.0`.
+If your implementation returns the other value, the bug is in the
+implementation, not in this table.
 
 **Accept:** `python3 -m unittest discover -v` green;
 `python3 -c "import kimbo"` exits 0.
@@ -243,9 +262,15 @@ ARC_BREAKPOINTS = {
 
 `arc_targets(name, n)` → list of `n` floats (or `n` `None`s for `"flat"`).
 Slot `i` has position `p = i / (n - 1)` (`p = 0.0` when `n == 1`); interpolate
-linearly between the surrounding breakpoints.
+linearly between the surrounding breakpoints — walk the consecutive
+breakpoint pairs and use the first pair whose right-hand position satisfies
+`p <= p2`, with `frac = (p - p1) / (p2 - p1)`. If `p` falls past the last
+breakpoint (floating-point drift at `p == 1.0`), use the last breakpoint's
+energy. The curves are continuous, so landing exactly on a shared breakpoint
+gives the same answer from either adjacent segment.
 
-`effective_energies(tracks)` → list of `n` floats:
+`effective_energies(tracks)` → list of `n` floats (coerce every value with
+`float()` so the list is uniformly floats):
 - If any track has `energy` set: use it (clamped to 1..5); missing → `3.0`.
 - Else if any track has `tempo`: proxy from tempo — rank tracks with known
   tempo ascending (ties broken by input index); energy
@@ -280,11 +305,27 @@ Add to `test_flow.py`:
   camelot filled via `to_camelot`. `order_tracks(tracks, "flat") == [0, 2, 1]`
   — from C/120, G/122 costs ~0.198 (0.15 key + 0.048 tempo) vs Em/176 ~1.295
   (0.4 key + 0.895 tempo).
-- **Properties** on an inline 8-track scrambled list (mix of keys around the
-  wheel, tempos 80–175 including one exact half/double pair, energies 1–5):
-  result is a permutation of `range(8)`; calling twice gives the same list;
-  and the mean `transition_cost` over consecutive pairs (with `slot_target
-  None`) is strictly lower for the flow order than for input order `0..7`.
+- **Properties** on this exact 8-track scrambled list — use these values
+  verbatim, do not invent your own (an invented list can happen to be
+  well-ordered already, and then the last assertion below fails through no
+  fault of the code). As `(key, tempo, energy)`, with `camelot` filled via
+  `to_camelot` and filler title/artist/album:
+
+  ```python
+  [("Am", 128, 4), ("F", 92, 2), ("Em", 174, 5), ("C", 100, 2),
+   ("G", 87, 1), ("Bm", 140, 4), ("Eb", 118, 3), ("Dm", 96, 2)]
+  ```
+
+  Assert: `order_tracks(eight, "flat")` is a permutation of `range(8)`;
+  calling it twice returns the same list; and the mean `transition_cost` over
+  consecutive pairs (called with `cand_energy=None, slot_target=None`) is
+  strictly lower for the flow order than for input order `0..7`.
+
+  Reference values from the spec above, for debugging only — do **not**
+  assert on them: the flat order is `[0, 5, 2, 4, 1, 7, 3, 6]`, mean cost
+  `1.0120` for input order versus `0.5522` for flow order. If your numbers
+  differ, your implementation deviates from this spec; fix the code, not the
+  test.
 
 **Accept:** all tests green.
 **Commit:** `flow: greedy arc-aware ordering engine`
@@ -307,7 +348,19 @@ Add to `test_flow.py`:
    previous track: `smooth` when `key_penalty <= FLOW_SMOOTH_KEY` and
    `bpm_gap dist <= FLOW_SMOOTH_BPM` (append `(half/double-time)` when the
    best ratio isn't 1.0); otherwise the applicable labels `key jump` /
-   `tempo jump`; `?` when data is missing on either side. End with two
+   `tempo jump`; `?` when data is missing on either side.
+
+   **Order of operations matters here.** `bpm_gap` divides by its first
+   argument and multiplies its second, so it raises `TypeError` on a `None`
+   tempo — and the fixture below deliberately contains a track with a blank
+   tempo, so getting this wrong crashes the Phase 3 acceptance run. Check
+   for missing data *first*: if either side's tempo is missing or `<= 0`,
+   emit `?` for the tempo half and never call `bpm_gap`; likewise emit `?`
+   for the key half when either `camelot` is `None`. Only call `bpm_gap`
+   once both tempos are known to be positive numbers. A join is `smooth`
+   only when both halves are known and both are within tolerance.
+
+   End with two
    summary lines: `Transitions: <n> total, <s> smooth` and
    `Rough transitions: input order <a> -> flow order <b>` (a rough
    transition is any non-smooth one between tracks that both have data).
@@ -324,9 +377,16 @@ Add to `test_flow.py`:
    `die("playlist mode arrives in a later phase")` for now.
 5. Update the module docstring: five subcommands → six, adding
    `flow      reorder by key/tempo/energy so the playlist plays smoothly`.
-6. Create the fixture `examples/garden-party-enriched.csv` **exactly**
+6. Add two lines to `.gitignore` so generated output stays untracked:
+   `*-flow.csv` and `*-tagging.txt`. (Do **not** remove or loosen the
+   existing `*-enriched.csv` line.)
+7. Create the fixture `examples/garden-party-tagged.csv` **exactly**
    (illustrative values; one half/double pair 174/87, one blank tempo, one
-   blank key):
+   blank key). The name matters: the repo's `.gitignore` already contains
+   `*-enriched.csv`, so a fixture named `...-enriched.csv` would be silently
+   untracked and the committed test suite would fail on a fresh clone.
+   Verify with `git check-ignore -v examples/garden-party-tagged.csv`, which
+   must print nothing and exit non-zero.
 
 ```csv
 Track name,Artist name,Album,Tempo,Key,Source,Energy,Vibe
@@ -353,12 +413,14 @@ same 12 title/artist pairs as the input.
 
 **Accept:** tests green, plus:
 ```
-python3 kimbo.py flow --csv examples/garden-party-enriched.csv
+python3 kimbo.py flow --csv examples/garden-party-tagged.csv
 ```
 exits 0, prints lines containing `arc: party`, `smooth`, `Transitions:`, and
-writes `examples/garden-party-enriched-flow.csv` with 13 lines (delete that
-generated file before committing — commit only the fixture);
-`python3 kimbo.py flow -h` and `python3 kimbo.py import -h` both exit 0.
+writes `examples/garden-party-tagged-flow.csv` with 13 lines (1 header + 12
+tracks; the `.gitignore` line added above keeps it out of the commit, so
+commit only the fixture); `python3 kimbo.py flow -h` and
+`python3 kimbo.py import -h` both exit 0. Confirm `git status --short` shows
+no generated CSV.
 **Commit:** `flow: CSV mode with transition report + example fixture`
 
 ### Phase 4 — `--tag-prompt` (the vibe layer)
@@ -391,7 +453,7 @@ Add a test: run the tag-prompt path on the fixture (temp dir); the output
 file contains `Energy column`, the CSV header, and `Last Slice`.
 
 **Accept:** tests green;
-`python3 kimbo.py flow --csv examples/garden-party-enriched.csv --tag-prompt --out /tmp/tagging.txt`
+`python3 kimbo.py flow --csv examples/garden-party-tagged.csv --tag-prompt --out /tmp/tagging.txt`
 exits 0 and the file exists.
 **Commit:** `flow: --tag-prompt generates the LLM vibe-tagging handoff`
 
@@ -423,8 +485,16 @@ diff against this spec.
      (description `kimbo flow: <arc> arc`), add the known track IDs in play
      order, 100 per `playlist_add_items` call, print the
      `https://open.spotify.com/playlist/` link.
-   - `--in-place`: `playlist_replace_items(playlist_id, first_100)` then
-     `playlist_add_items` for the rest in 100s. Print the link.
+   - `--in-place`: destructive and **not undoable through Spotify** — it
+     overwrites the user's existing playlist, and any track whose ID could
+     not be resolved (local files, unavailable tracks) is dropped rather
+     than reordered. So, in this order: (a) write a backup CSV of the
+     **original** order to `<slug>-before-flow.csv` using the same writer as
+     step 2, and print its path; (b) print a one-line count of any tracks
+     being dropped for want of an ID; (c) only then
+     `playlist_replace_items(playlist_id, first_100)` followed by
+     `playlist_add_items` for the rest in 100s. Print the link. If the
+     backup CSV cannot be written, `die` before touching the playlist.
    - Neither flag → report + CSV only (the safe default).
 4. GetSongBPM cache (small win; skip this item if it causes any trouble):
    `load_bpm_cache()` / `save_bpm_cache(cache)` reading/writing JSON at
@@ -464,8 +534,8 @@ diff against this spec.
 
 **Accept:** `python3 -m unittest discover -v` green; a final read of
 `git diff main` confirms only planned files changed
-(`kimbo.py`, `test_flow.py`, `examples/garden-party-enriched.csv`,
-`README.md`, `FLOW-PLAN.md`).
+(`kimbo.py`, `test_flow.py`, `examples/garden-party-tagged.csv`,
+`.gitignore`, `README.md`, `FLOW-PLAN.md`).
 **Commit:** `flow: document the new command`
 
 ### Progress
