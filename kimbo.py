@@ -9,6 +9,8 @@ Redux of the old playlist-generator script. Five subcommands:
   discover  Genius lyric-density search -> a candidates playlist or CSV
   enrich    add tempo/key columns via GetSongBPM (and Spotify
             audio-features, when your app still has access)
+  resort    reorder a playlist in place by tempo, key (Camelot wheel),
+            or key-then-tempo
 
 Run `python3 kimbo.py <command> -h` for options. Credentials come from
 environment variables; see .env.example.
@@ -545,6 +547,95 @@ def cmd_setup(args):
     print("\nDone. Try: python3 kimbo.py import --csv examples/oil-anti-canon.csv --dry-run")
 
 
+
+# ----------------------------------------------------------------- resort ---
+
+FLAT_TO_SHARP = {"DB": "C#", "EB": "D#", "GB": "F#", "AB": "G#", "BB": "A#",
+                 "CB": "B", "FB": "E"}
+
+
+def camelot(key_str):
+    """Map a key name ('Em', 'F#', 'Bb', 'C#m') to its Camelot wheel slot
+    (number 1-12, letter A=minor/B=major). Returns None if unparseable.
+    Adjacent numbers and same-number A/B pairs mix harmonically."""
+    if not key_str:
+        return None
+    k = key_str.strip().replace("\u266f", "#").replace("\u266d", "b")
+    minor = k.lower().endswith("min") or (k.endswith("m") and not k.lower().endswith("maj"))
+    root = re.sub(r"(?i)(maj|min|m)$", "", k).strip().upper()
+    root = FLAT_TO_SHARP.get(root, root)
+    if root not in PITCH_CLASSES:
+        return None
+    pc = PITCH_CLASSES.index(root)
+    if minor:
+        pc = (pc + 3) % 12          # relative major shares the slot number
+    number = ((pc * 7) % 12 + 7) % 12 + 1
+    return (number, "A" if minor else "B")
+
+
+def sort_key(row, by):
+    """row = (title, artist, album, tempo, key). Unknowns sort last, stably."""
+    tempo = None
+    try:
+        tempo = float(row[3])
+    except (TypeError, ValueError):
+        pass
+    cam = camelot(row[4])
+    big = (999, "Z")
+    if by == "tempo":
+        return (tempo is None, tempo or 0)
+    if by == "key":
+        return (cam is None, cam or big)
+    return (cam is None and tempo is None, cam or big, tempo or 0)   # key-tempo
+
+
+def cmd_resort(args):
+    sp = spotify_client()
+    playlist_id = args.playlist_id or playlist_by_title(sp, args.title or "")
+    if not playlist_id:
+        die("playlist not found - pass --playlist-id or an exact --title you own")
+    rows = playlist_rows(sp, playlist_id)
+    ids = playlist_track_ids(sp, playlist_id)
+
+    print("Looking up tempo/key for %d tracks..." % len(rows))
+    by_id = spotify_features(sp, ids)
+    api_key = os.environ.get("GETSONGBPM_KEY")
+    session = requests.Session()
+    enriched = []
+    for i, (title, artist, album) in enumerate(rows):
+        tempo, key = "", ""
+        if i < len(ids) and ids[i] in by_id:
+            tempo, key, _ = by_id[ids[i]]
+        elif api_key:
+            hit = getsongbpm_lookup(session, api_key, title, artist)
+            if hit:
+                tempo, key = hit[0], hit[1]
+            time.sleep(0.6)
+        enriched.append((title, artist, album, tempo, key, ids[i] if i < len(ids) else None))
+
+    order = sorted(enriched, key=lambda r: sort_key(r, args.by), reverse=args.desc)
+    print("\nProposed order (--by %s%s):" % (args.by, ", descending" if args.desc else ""))
+    known = 0
+    for title, artist, album, tempo, key, _tid in order:
+        cam = camelot(key)
+        known += 1 if (tempo or key) else 0
+        print("  %-7s %-4s %-4s %s - %s" % (tempo or "-", key or "-",
+              ("%d%s" % cam) if cam else "-", artist, title))
+    print("\n%d/%d tracks had tempo/key data; unknowns sink to the bottom in "
+          "their current order." % (known, len(order)))
+    if args.dry_run:
+        print("--dry-run: playlist untouched.")
+        return
+    if not api_key and not by_id:
+        die("no tempo/key data at all - set GETSONGBPM_KEY (kimbo.py setup) "
+            "before resorting, or this would just shuffle unknowns")
+    new_ids = [t[5] for t in order if t[5]]
+    sp.playlist_replace_items(playlist_id, new_ids[:100])
+    for start in range(100, len(new_ids), 100):
+        sp.playlist_add_items(playlist_id, new_ids[start:start + 100])
+    print("Reordered in place: https://open.spotify.com/playlist/" + playlist_id)
+
+
 # -------------------------------------------------------------------- CLI ---
 
 def main():
@@ -585,6 +676,15 @@ def main():
                    help="skip lyric texts shorter than this many characters")
     p.add_argument("--dry-run", action="store_true", help="score and print, add nothing")
     p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("resort", help="reorder a playlist in place by tempo/key")
+    p.add_argument("--playlist-id")
+    p.add_argument("--title", help="exact name of a playlist you own")
+    p.add_argument("--by", choices=["tempo", "key", "key-tempo"], default="tempo",
+                   help="tempo ramp, Camelot-wheel key order, or key groups with tempo ramps inside")
+    p.add_argument("--desc", action="store_true", help="high to low")
+    p.add_argument("--dry-run", action="store_true", help="print the proposed order, change nothing")
+    p.set_defaults(func=cmd_resort)
 
     p = sub.add_parser("enrich", help="add tempo/key columns")
     p.add_argument("--csv")

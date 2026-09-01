@@ -35,6 +35,8 @@ python3 kimbo.py discover -q "company store" -m "company store" "sixteen tons" -
 python3 kimbo.py discover -q oilfield --threshold 2.0 --pages 8
 python3 kimbo.py enrich   --csv list.csv                # writes list-enriched.csv
 python3 kimbo.py enrich   --playlist-id 3cEYpjA9...     # tempo/key for a live playlist
+python3 kimbo.py resort   --title "Black Waters" --by key-tempo --dry-run
+python3 kimbo.py resort   --title "Black Waters" --by tempo    # reorder in place
 ```
 
 Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages).
@@ -50,7 +52,7 @@ Header `Track name, Artist name, Album` (TuneMyMusic's format — the files in `
 
 ### Tempo and key: the honest state
 
-Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For accurate, complete values the real options are local: **librosa/Essentia** analysis of audio files you own, or **Mixed In Key / rekordbox** if the goal is DJ-grade key matching — both analyze actual audio rather than looking anything up. A natural next command is `resort`: run `enrich`, then reorder a playlist in place (`playlist_replace_items`) by tempo band within theme blocks.
+Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For accurate, complete values the real options are local: **librosa/Essentia** analysis of audio files you own, or **Mixed In Key / rekordbox** if the goal is DJ-grade key matching — both analyze actual audio rather than looking anything up. `resort` reorders a playlist in place using that data: `--by tempo` (slow-to-fast ramp), `--by key` (around the Camelot wheel, so neighbours mix harmonically), or `--by key-tempo` (key groups with tempo ramps inside). Always try `--dry-run` first; unknowns sink to the bottom in their current order.
 
 ### TuneMyMusic integration: what's real
 
