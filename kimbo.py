@@ -4,7 +4,8 @@
 Redux of the old playlist-generator script. Five subcommands:
 
   setup     guided walkthrough: get every credential, store and test them
-  import    CSV -> Spotify playlist (ordered, deduped, reports misses)
+  import    CSV -> Spotify playlist (ordered, deduped, reports misses);
+            point it at a directory to import every CSV in one run
   export    Spotify playlist -> CSV in the same format
   discover  Genius lyric-density search -> a candidates playlist or CSV
   enrich    add tempo/key columns via GetSongBPM (and Spotify
@@ -146,10 +147,25 @@ def write_rows(path, rows):
 
 # ----------------------------------------------------------------- import ---
 
-def cmd_import(args):
-    rows = read_rows(args.csv)
-    print("Read %d rows from %s" % (len(rows), args.csv))
-    sp = spotify_client()
+
+def title_from_filename(path, prefix=""):
+    """'playlists/06-black-waters.csv' -> 'Black Waters'. Strips a leading
+    NN- ordering prefix, un-dashes, and title-cases, leaving small words
+    lowercase except at the start."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r"^\d+[-_]", "", stem)
+    small = {"a", "an", "and", "the", "to", "of", "in", "on", "by"}
+    parts = stem.replace("_", "-").split("-")
+    words = []
+    for i, word in enumerate(parts):
+        minor = word.lower() in small and 0 < i < len(parts) - 1
+        words.append(word if minor else word.capitalize())
+    return (prefix + " " if prefix else "") + " ".join(words)
+
+
+def import_one(args, sp, csv_path, title):
+    rows = read_rows(csv_path)
+    print("\nRead %d rows from %s" % (len(rows), csv_path))
 
     resolved, misses = [], []
     for i, (title, artist) in enumerate(rows, 1):
@@ -174,7 +190,6 @@ def cmd_import(args):
 
     playlist_id = args.playlist_id
     if not playlist_id:
-        title = args.title or os.path.splitext(os.path.basename(args.csv))[0]
         playlist_id = playlist_by_title(sp, title)
         if playlist_id:
             print("\nUsing existing playlist '%s'" % title)
@@ -198,6 +213,48 @@ def cmd_import(args):
     print("Added %d tracks (%d already present, %d unmatched)."
           % (len(to_add), len(resolved) - len(to_add), len(misses)))
     print("Playlist: https://open.spotify.com/playlist/" + playlist_id)
+    return len(to_add), len(misses)
+
+
+def cmd_import(args):
+    """Dispatch one CSV or every CSV in a directory."""
+    if os.path.isdir(args.csv):
+        paths = sorted(os.path.join(args.csv, n) for n in os.listdir(args.csv)
+                       if n.lower().endswith(".csv"))
+        if not paths:
+            die("no .csv files in %s" % args.csv)
+        if args.title:
+            die("--title makes no sense for a directory - titles come from "
+                "the filenames (use --prefix to namespace them)")
+        if args.playlist_id:
+            die("--playlist-id makes no sense for a directory - it would pile "
+                "every playlist into one")
+        print("Importing %d playlists from %s\n" % (len(paths), args.csv))
+        for path in paths:
+            print("  %-42s -> %s" % (os.path.basename(path),
+                                     title_from_filename(path, args.prefix)))
+        summary = []
+        for path in paths:
+            title = title_from_filename(path, args.prefix)
+            print("\n" + "=" * 60 + "\n%s" % title)
+            added, missed = import_one(args, sp_shared(args), path, title)
+            summary.append((title, added, missed))
+        print("\n" + "=" * 60 + "\nDone.")
+        for title, added, missed in summary:
+            print("  %-34s %3d added, %d unmatched" % (title, added, missed))
+        return
+    title = args.title or title_from_filename(args.csv, args.prefix)
+    import_one(args, sp_shared(args), args.csv, title)
+
+
+_SP = []
+
+
+def sp_shared(args):
+    """One authenticated client reused across a directory import."""
+    if not _SP:
+        _SP.append(spotify_client())
+    return _SP[0]
 
 
 # ----------------------------------------------------------------- export ---
@@ -647,9 +704,10 @@ def main():
     p.add_argument("--check", action="store_true", help="validate existing credentials, no prompts")
     p.set_defaults(func=cmd_setup)
 
-    p = sub.add_parser("import", help="CSV -> Spotify playlist, order preserved")
-    p.add_argument("--csv", required=True)
-    p.add_argument("--title", help="playlist name (default: CSV filename)")
+    p = sub.add_parser("import", help="CSV (or a directory of CSVs) -> Spotify playlists")
+    p.add_argument("--csv", required=True, help="a .csv file, or a directory to import all of")
+    p.add_argument("--title", help="playlist name (default: derived from the filename)")
+    p.add_argument("--prefix", default="", help="prepend to every derived title, e.g. --prefix 'S&T'")
     p.add_argument("--playlist-id", help="add to an existing playlist instead")
     p.add_argument("--public", action="store_true", help="create as public (default private)")
     p.add_argument("--replace", action="store_true", help="clear the playlist first")

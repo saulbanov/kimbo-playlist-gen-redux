@@ -28,6 +28,7 @@ Manual fallback: copy `.env.example` to `.env` and fill it in yourself — the f
 ### Commands
 
 ```
+python3 kimbo.py import   --csv ../suit-and-tie/playlists/          # ALL of them, one run
 python3 kimbo.py import   --csv examples/suit-and-tie-sessions.csv --title "Suit and Tie Sessions"
 python3 kimbo.py import   --csv list.csv --playlist-id 3cEYpjA9oz9GiPac4AsH4n   # append to existing
 python3 kimbo.py export   --title "Oilfield Songs" --out oilfield.csv
