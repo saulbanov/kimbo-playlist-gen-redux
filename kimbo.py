@@ -51,10 +51,10 @@ def spotify_client():
     """
     try:
         import spotipy
-        from spotipy.oauth2 import SpotifyOAuth
+        from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
     except ImportError:
         die("spotipy not installed: pip3 install -r requirements.txt")
-    for var in ("SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI"):
+    for var in ("SPOTIPY_CLIENT_ID", "SPOTIPY_REDIRECT_URI"):
         if not os.environ.get(var):
             die("%s is not set - run `python3 kimbo.py setup` for a guided "
                 "walkthrough (or copy .env.example to .env and fill it in; "
@@ -62,7 +62,15 @@ def spotify_client():
     cache = os.path.expanduser("~/.cache/kimbo/spotify-token")
     os.makedirs(os.path.dirname(cache), exist_ok=True)
     scope = "playlist-modify-public playlist-modify-private playlist-read-private"
-    return spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope, cache_path=cache))
+    if os.environ.get("SPOTIPY_CLIENT_SECRET"):
+        auth = SpotifyOAuth(scope=scope, cache_path=cache)
+    else:
+        # No secret on hand: PKCE proves identity with a one-time code
+        # challenge instead. Spotify's recommended flow for desktop apps,
+        # and it needs only the client ID.
+        auth = SpotifyPKCE(scope=scope, cache_path=cache,
+                           open_browser=True)
+    return spotipy.Spotify(auth_manager=auth)
 
 
 def find_track(sp, title, artist):
@@ -544,9 +552,11 @@ def _validate(values, try_spotify):
         print("  GetSongBPM key:  %s" % ("OK" if _check_getsongbpm(values["GETSONGBPM_KEY"]) else "FAILED - recheck it"))
     else:
         print("  GetSongBPM key:  skipped (only needed for `enrich`)")
-    if not (values["SPOTIPY_CLIENT_ID"] and values["SPOTIPY_CLIENT_SECRET"]):
-        print("  Spotify:         NOT CONFIGURED - every command needs it")
+    if not values["SPOTIPY_CLIENT_ID"]:
+        print("  Spotify:         NOT CONFIGURED - every command needs a Client ID")
         return
+    mode = "client secret" if values["SPOTIPY_CLIENT_SECRET"] else "PKCE (no secret)"
+    print("  Spotify auth:    %s" % mode)
     if try_spotify and input("  Test Spotify auth now? Opens a browser once. [y/N]: ").strip().lower() == "y":
         try:
             me = spotify_client().me()
@@ -576,9 +586,15 @@ def cmd_setup(args):
     print("  3. Redirect URI: enter EXACTLY  http://127.0.0.1:8888/callback  and click Add.")
     print("     Spotify rejects 'localhost' for new apps - it must be this loopback form or HTTPS.")
     print("  4. Tick 'Web API', save, then open the app's Settings")
-    print("  5. Copy the Client ID, then 'View client secret' and copy that too\n")
+    print("  5. Copy the Client ID from the Settings page")
+    print("")
+    print("  The Client Secret is OPTIONAL - press Enter to skip it and kimbo")
+    print("  uses PKCE instead (Spotify's recommended flow for desktop apps;")
+    print("  nothing secret to store). If you do want it: on that same")
+    print("  Settings page, under the Client ID, click 'View client secret'.\n")
     values["SPOTIPY_CLIENT_ID"] = _ask("Client ID", values["SPOTIPY_CLIENT_ID"])
-    values["SPOTIPY_CLIENT_SECRET"] = _ask("Client Secret", values["SPOTIPY_CLIENT_SECRET"])
+    values["SPOTIPY_CLIENT_SECRET"] = _ask("Client Secret (optional - Enter to use PKCE)",
+                                           values["SPOTIPY_CLIENT_SECRET"])
     values["SPOTIPY_REDIRECT_URI"] = _ask("Redirect URI", values["SPOTIPY_REDIRECT_URI"])
 
     print("\nSTEP 2 of 3 - Genius (only for `discover`; press Enter to skip)")
