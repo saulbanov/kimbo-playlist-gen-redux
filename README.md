@@ -39,6 +39,15 @@ python3 kimbo.py enrich   --playlist-id 3cEYpjA9...     # tempo/key for a live p
 
 Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages).
 
+
+### The playlist rack
+
+`playlists/` ships the ten curated playlists this tool was built around — the devil-in-a-suit protest rack (suit-and-tie sessions, new wave, company town, the groove, austerity isles, black waters, oil anti-canon, the 115-track full flow and 58-track tight cut) plus "Nowhere to Make Out," the place-as-pleasure set seeded from Paul Cauthen's "Bayou By You." Each has a CSV (`kimbo.py import` or TuneMyMusic) and a TXT twin (Spotlistr). `playlists/README.md` has the table and the known search misses. Import one with:
+
+```
+python3 kimbo.py import --csv playlists/10-nowhere-to-make-out.csv --title "Nowhere to Make Out"
+```
+
 ### CSV format
 
 Header `Track name, Artist name, Album` (TuneMyMusic's format — the files in `examples/` and the devil-in-a-suit `playlists/` folder are already in it), or headerless `title,artist`. Album is carried but never used for matching.
