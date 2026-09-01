@@ -194,7 +194,7 @@ def import_one(args, sp, csv_path, title):
             print("  row %d: %s - %s" % (i, artist, title))
     if args.dry_run:
         print("\n--dry-run: nothing written to Spotify.")
-        return
+        return 0, len(misses)
 
     playlist_id = args.playlist_id
     if not playlist_id:
@@ -245,11 +245,15 @@ def cmd_import(args):
         for path in paths:
             title = title_from_filename(path, args.prefix)
             print("\n" + "=" * 60 + "\n%s" % title)
-            added, missed = import_one(args, sp_shared(args), path, title)
-            summary.append((title, added, missed))
-        print("\n" + "=" * 60 + "\nDone.")
+            result = import_one(args, sp_shared(args), path, title)
+            summary.append((title,) + (result or (0, 0)))
+        print("\n" + "=" * 60 + "\n%s" % ("Dry run complete - nothing written."
+                                          if args.dry_run else "Done."))
         for title, added, missed in summary:
-            print("  %-34s %3d added, %d unmatched" % (title, added, missed))
+            print("  %-34s %3d %s, %d unmatched"
+                  % (title, added, "would add" if args.dry_run else "added", missed))
+        if args.dry_run:
+            print("\nRe-run without --dry-run to create these playlists.")
         return
     title = args.title or title_from_filename(args.csv, args.prefix)
     import_one(args, sp_shared(args), args.csv, title)
