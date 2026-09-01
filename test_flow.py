@@ -278,5 +278,24 @@ class TestSlugify(unittest.TestCase):
         self.assertEqual(kimbo.slugify("!!!"), "playlist")
 
 
+class TestSharedCamelotParser(unittest.TestCase):
+    """`resort` and `flow` must read keys the same way.
+
+    They arrived on separate branches with separate FLAT_TO_SHARP tables -
+    one keyed "Db", the other "DB" - and whichever module-level definition
+    loaded second silently turned every flat key into None for the other."""
+
+    def test_flats_survive(self):
+        for raw, want in [("Bb", "6B"), ("Ebm", "2A"), ("Db", "3B"),
+                          ("Ab", "4B"), ("Gb", "2B")]:
+            self.assertEqual(kimbo.to_camelot(raw), want, raw)
+
+    def test_both_entry_points_agree(self):
+        for raw in ("Am", "C", "Bb", "Ebm", "F#m", "E minor", "Db", "", "?"):
+            code = kimbo.to_camelot(raw)
+            expected = kimbo.camelot_parts(code) if code else None
+            self.assertEqual(kimbo.camelot(raw), expected, raw)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,12 +4,15 @@
 Redux of the old playlist-generator script. Six subcommands:
 
   setup     guided walkthrough: get every credential, store and test them
-  import    CSV -> Spotify playlist (ordered, deduped, reports misses)
+  import    CSV -> Spotify playlist (ordered, deduped, reports misses);
+            point it at a directory to import every CSV in one run
   export    Spotify playlist -> CSV in the same format
   discover  Genius lyric-density search -> a candidates playlist or CSV
   enrich    add tempo/key columns via GetSongBPM (and Spotify
             audio-features, when your app still has access)
-  flow      reorder by key/tempo/energy so the playlist plays smoothly
+  resort    reorder a playlist in place by tempo, key (Camelot wheel),
+            or key-then-tempo
+  flow      chain tracks by key/tempo/energy so the playlist plays smoothly
 
 Run `python3 kimbo.py <command> -h` for options. Credentials come from
 environment variables; see .env.example.
@@ -51,10 +54,10 @@ def spotify_client():
     """
     try:
         import spotipy
-        from spotipy.oauth2 import SpotifyOAuth
+        from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
     except ImportError:
         die("spotipy not installed: pip3 install -r requirements.txt")
-    for var in ("SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI"):
+    for var in ("SPOTIPY_CLIENT_ID", "SPOTIPY_REDIRECT_URI"):
         if not os.environ.get(var):
             die("%s is not set - run `python3 kimbo.py setup` for a guided "
                 "walkthrough (or copy .env.example to .env and fill it in; "
@@ -62,7 +65,15 @@ def spotify_client():
     cache = os.path.expanduser("~/.cache/kimbo/spotify-token")
     os.makedirs(os.path.dirname(cache), exist_ok=True)
     scope = "playlist-modify-public playlist-modify-private playlist-read-private"
-    return spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope, cache_path=cache))
+    if os.environ.get("SPOTIPY_CLIENT_SECRET"):
+        auth = SpotifyOAuth(scope=scope, cache_path=cache)
+    else:
+        # No secret on hand: PKCE proves identity with a one-time code
+        # challenge instead. Spotify's recommended flow for desktop apps,
+        # and it needs only the client ID.
+        auth = SpotifyPKCE(scope=scope, cache_path=cache,
+                           open_browser=True)
+    return spotipy.Spotify(auth_manager=auth)
 
 
 def find_track(sp, title, artist):
@@ -147,10 +158,25 @@ def write_rows(path, rows):
 
 # ----------------------------------------------------------------- import ---
 
-def cmd_import(args):
-    rows = read_rows(args.csv)
-    print("Read %d rows from %s" % (len(rows), args.csv))
-    sp = spotify_client()
+
+def title_from_filename(path, prefix=""):
+    """'playlists/06-black-waters.csv' -> 'Black Waters'. Strips a leading
+    NN- ordering prefix, un-dashes, and title-cases, leaving small words
+    lowercase except at the start."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r"^\d+[-_]", "", stem)
+    small = {"a", "an", "and", "the", "to", "of", "in", "on", "by"}
+    parts = stem.replace("_", "-").split("-")
+    words = []
+    for i, word in enumerate(parts):
+        minor = word.lower() in small and 0 < i < len(parts) - 1
+        words.append(word if minor else word.capitalize())
+    return (prefix + " " if prefix else "") + " ".join(words)
+
+
+def import_one(args, sp, csv_path, title):
+    rows = read_rows(csv_path)
+    print("\nRead %d rows from %s" % (len(rows), csv_path))
 
     resolved, misses = [], []
     for i, (title, artist) in enumerate(rows, 1):
@@ -171,11 +197,10 @@ def cmd_import(args):
             print("  row %d: %s - %s" % (i, artist, title))
     if args.dry_run:
         print("\n--dry-run: nothing written to Spotify.")
-        return
+        return 0, len(misses)
 
     playlist_id = args.playlist_id
     if not playlist_id:
-        title = args.title or os.path.splitext(os.path.basename(args.csv))[0]
         playlist_id = playlist_by_title(sp, title)
         if playlist_id:
             print("\nUsing existing playlist '%s'" % title)
@@ -199,6 +224,52 @@ def cmd_import(args):
     print("Added %d tracks (%d already present, %d unmatched)."
           % (len(to_add), len(resolved) - len(to_add), len(misses)))
     print("Playlist: https://open.spotify.com/playlist/" + playlist_id)
+    return len(to_add), len(misses)
+
+
+def cmd_import(args):
+    """Dispatch one CSV or every CSV in a directory."""
+    if os.path.isdir(args.csv):
+        paths = sorted(os.path.join(args.csv, n) for n in os.listdir(args.csv)
+                       if n.lower().endswith(".csv"))
+        if not paths:
+            die("no .csv files in %s" % args.csv)
+        if args.title:
+            die("--title makes no sense for a directory - titles come from "
+                "the filenames (use --prefix to namespace them)")
+        if args.playlist_id:
+            die("--playlist-id makes no sense for a directory - it would pile "
+                "every playlist into one")
+        print("Importing %d playlists from %s\n" % (len(paths), args.csv))
+        for path in paths:
+            print("  %-42s -> %s" % (os.path.basename(path),
+                                     title_from_filename(path, args.prefix)))
+        summary = []
+        for path in paths:
+            title = title_from_filename(path, args.prefix)
+            print("\n" + "=" * 60 + "\n%s" % title)
+            result = import_one(args, sp_shared(args), path, title)
+            summary.append((title,) + (result or (0, 0)))
+        print("\n" + "=" * 60 + "\n%s" % ("Dry run complete - nothing written."
+                                          if args.dry_run else "Done."))
+        for title, added, missed in summary:
+            print("  %-34s %3d %s, %d unmatched"
+                  % (title, added, "would add" if args.dry_run else "added", missed))
+        if args.dry_run:
+            print("\nRe-run without --dry-run to create these playlists.")
+        return
+    title = args.title or title_from_filename(args.csv, args.prefix)
+    import_one(args, sp_shared(args), args.csv, title)
+
+
+_SP = []
+
+
+def sp_shared(args):
+    """One authenticated client reused across a directory import."""
+    if not _SP:
+        _SP.append(spotify_client())
+    return _SP[0]
 
 
 # ----------------------------------------------------------------- export ---
@@ -1001,9 +1072,11 @@ def _validate(values, try_spotify):
         print("  GetSongBPM key:  %s" % ("OK" if _check_getsongbpm(values["GETSONGBPM_KEY"]) else "FAILED - recheck it"))
     else:
         print("  GetSongBPM key:  skipped (only needed for `enrich`)")
-    if not (values["SPOTIPY_CLIENT_ID"] and values["SPOTIPY_CLIENT_SECRET"]):
-        print("  Spotify:         NOT CONFIGURED - every command needs it")
+    if not values["SPOTIPY_CLIENT_ID"]:
+        print("  Spotify:         NOT CONFIGURED - every command needs a Client ID")
         return
+    mode = "client secret" if values["SPOTIPY_CLIENT_SECRET"] else "PKCE (no secret)"
+    print("  Spotify auth:    %s" % mode)
     if try_spotify and input("  Test Spotify auth now? Opens a browser once. [y/N]: ").strip().lower() == "y":
         try:
             me = spotify_client().me()
@@ -1033,9 +1106,15 @@ def cmd_setup(args):
     print("  3. Redirect URI: enter EXACTLY  http://127.0.0.1:8888/callback  and click Add.")
     print("     Spotify rejects 'localhost' for new apps - it must be this loopback form or HTTPS.")
     print("  4. Tick 'Web API', save, then open the app's Settings")
-    print("  5. Copy the Client ID, then 'View client secret' and copy that too\n")
+    print("  5. Copy the Client ID from the Settings page")
+    print("")
+    print("  The Client Secret is OPTIONAL - press Enter to skip it and kimbo")
+    print("  uses PKCE instead (Spotify's recommended flow for desktop apps;")
+    print("  nothing secret to store). If you do want it: on that same")
+    print("  Settings page, under the Client ID, click 'View client secret'.\n")
     values["SPOTIPY_CLIENT_ID"] = _ask("Client ID", values["SPOTIPY_CLIENT_ID"])
-    values["SPOTIPY_CLIENT_SECRET"] = _ask("Client Secret", values["SPOTIPY_CLIENT_SECRET"])
+    values["SPOTIPY_CLIENT_SECRET"] = _ask("Client Secret (optional - Enter to use PKCE)",
+                                           values["SPOTIPY_CLIENT_SECRET"])
     values["SPOTIPY_REDIRECT_URI"] = _ask("Redirect URI", values["SPOTIPY_REDIRECT_URI"])
 
     print("\nSTEP 2 of 3 - Genius (only for `discover`; press Enter to skip)")
@@ -1061,6 +1140,83 @@ def cmd_setup(args):
     print("\nDone. Try: python3 kimbo.py import --csv examples/oil-anti-canon.csv --dry-run")
 
 
+
+# ----------------------------------------------------------------- resort ---
+
+def camelot(key_str):
+    """(number 1-12, letter A=minor/B=major) for a key name, or None.
+
+    Delegates to the flow section's converter so the two commands cannot
+    drift apart - they had separate FLAT_TO_SHARP tables with different
+    capitalisation, and whichever loaded second silently broke the other's
+    flat keys."""
+    code = to_camelot(key_str)
+    return camelot_parts(code) if code else None
+
+
+def sort_key(row, by):
+    """row = (title, artist, album, tempo, key). Unknowns sort last, stably."""
+    tempo = None
+    try:
+        tempo = float(row[3])
+    except (TypeError, ValueError):
+        pass
+    cam = camelot(row[4])
+    big = (999, "Z")
+    if by == "tempo":
+        return (tempo is None, tempo or 0)
+    if by == "key":
+        return (cam is None, cam or big)
+    return (cam is None and tempo is None, cam or big, tempo or 0)   # key-tempo
+
+
+def cmd_resort(args):
+    sp = spotify_client()
+    playlist_id = args.playlist_id or playlist_by_title(sp, args.title or "")
+    if not playlist_id:
+        die("playlist not found - pass --playlist-id or an exact --title you own")
+    rows = playlist_rows(sp, playlist_id)
+    ids = playlist_track_ids(sp, playlist_id)
+
+    print("Looking up tempo/key for %d tracks..." % len(rows))
+    by_id = spotify_features(sp, ids)
+    api_key = os.environ.get("GETSONGBPM_KEY")
+    session = requests.Session()
+    enriched = []
+    for i, (title, artist, album) in enumerate(rows):
+        tempo, key = "", ""
+        if i < len(ids) and ids[i] in by_id:
+            tempo, key, _ = by_id[ids[i]]
+        elif api_key:
+            hit = getsongbpm_lookup(session, api_key, title, artist)
+            if hit:
+                tempo, key = hit[0], hit[1]
+            time.sleep(0.6)
+        enriched.append((title, artist, album, tempo, key, ids[i] if i < len(ids) else None))
+
+    order = sorted(enriched, key=lambda r: sort_key(r, args.by), reverse=args.desc)
+    print("\nProposed order (--by %s%s):" % (args.by, ", descending" if args.desc else ""))
+    known = 0
+    for title, artist, album, tempo, key, _tid in order:
+        cam = camelot(key)
+        known += 1 if (tempo or key) else 0
+        print("  %-7s %-4s %-4s %s - %s" % (tempo or "-", key or "-",
+              ("%d%s" % cam) if cam else "-", artist, title))
+    print("\n%d/%d tracks had tempo/key data; unknowns sink to the bottom in "
+          "their current order." % (known, len(order)))
+    if args.dry_run:
+        print("--dry-run: playlist untouched.")
+        return
+    if not api_key and not by_id:
+        die("no tempo/key data at all - set GETSONGBPM_KEY (kimbo.py setup) "
+            "before resorting, or this would just shuffle unknowns")
+    new_ids = [t[5] for t in order if t[5]]
+    sp.playlist_replace_items(playlist_id, new_ids[:100])
+    for start in range(100, len(new_ids), 100):
+        sp.playlist_add_items(playlist_id, new_ids[start:start + 100])
+    print("Reordered in place: https://open.spotify.com/playlist/" + playlist_id)
+
+
 # -------------------------------------------------------------------- CLI ---
 
 def main():
@@ -1072,9 +1228,10 @@ def main():
     p.add_argument("--check", action="store_true", help="validate existing credentials, no prompts")
     p.set_defaults(func=cmd_setup)
 
-    p = sub.add_parser("import", help="CSV -> Spotify playlist, order preserved")
-    p.add_argument("--csv", required=True)
-    p.add_argument("--title", help="playlist name (default: CSV filename)")
+    p = sub.add_parser("import", help="CSV (or a directory of CSVs) -> Spotify playlists")
+    p.add_argument("--csv", required=True, help="a .csv file, or a directory to import all of")
+    p.add_argument("--title", help="playlist name (default: derived from the filename)")
+    p.add_argument("--prefix", default="", help="prepend to every derived title, e.g. --prefix 'S&T'")
     p.add_argument("--playlist-id", help="add to an existing playlist instead")
     p.add_argument("--public", action="store_true", help="create as public (default private)")
     p.add_argument("--replace", action="store_true", help="clear the playlist first")
@@ -1101,6 +1258,15 @@ def main():
                    help="skip lyric texts shorter than this many characters")
     p.add_argument("--dry-run", action="store_true", help="score and print, add nothing")
     p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("resort", help="reorder a playlist in place by tempo/key")
+    p.add_argument("--playlist-id")
+    p.add_argument("--title", help="exact name of a playlist you own")
+    p.add_argument("--by", choices=["tempo", "key", "key-tempo"], default="tempo",
+                   help="tempo ramp, Camelot-wheel key order, or key groups with tempo ramps inside")
+    p.add_argument("--desc", action="store_true", help="high to low")
+    p.add_argument("--dry-run", action="store_true", help="print the proposed order, change nothing")
+    p.set_defaults(func=cmd_resort)
 
     p = sub.add_parser("enrich", help="add tempo/key columns")
     p.add_argument("--csv")

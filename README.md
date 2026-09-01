@@ -30,6 +30,7 @@ Manual fallback: copy `.env.example` to `.env` and fill it in yourself — the f
 ### Commands
 
 ```
+python3 kimbo.py import   --csv ../suit-and-tie/playlists/          # ALL of them, one run
 python3 kimbo.py import   --csv examples/suit-and-tie-sessions.csv --title "Suit and Tie Sessions"
 python3 kimbo.py import   --csv list.csv --playlist-id 3cEYpjA9oz9GiPac4AsH4n   # append to existing
 python3 kimbo.py export   --title "Oilfield Songs" --out oilfield.csv
@@ -37,11 +38,18 @@ python3 kimbo.py discover -q "company store" -m "company store" "sixteen tons" -
 python3 kimbo.py discover -q oilfield --threshold 2.0 --pages 8
 python3 kimbo.py enrich   --csv list.csv                # writes list-enriched.csv
 python3 kimbo.py enrich   --playlist-id 3cEYpjA9...     # tempo/key for a live playlist
+python3 kimbo.py resort   --title "Black Waters" --by key-tempo --dry-run
+python3 kimbo.py resort   --title "Black Waters" --by tempo    # reorder in place
 python3 kimbo.py flow     --csv list-enriched.csv --arc party   # writes list-enriched-flow.csv
 python3 kimbo.py flow     --playlist-id 3cEYpjA9... --apply     # new "<name> (flow)" playlist
 ```
 
 Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages). `flow --arc flat|steady|party|chill|build`, `--tag-prompt` (write the vibe-tagging prompt), `--apply` / `--in-place` (push the new order back).
+
+
+### The playlist rack
+
+The ten curated playlists this tool was built around live in their own repo, [suit-and-tie](https://github.com/saulbanov/suit-and-tie) — import any of its `playlists/*.csv` with `kimbo.py import`. Two stay here in `examples/` for smoke-testing.
 
 ### CSV format
 
@@ -49,7 +57,7 @@ Header `Track name, Artist name, Album` (TuneMyMusic's format — the files in `
 
 ### Tempo and key: the honest state
 
-Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For accurate, complete values the real options are local: **librosa/Essentia** analysis of audio files you own, or **Mixed In Key / rekordbox** if the goal is DJ-grade key matching — both analyze actual audio rather than looking anything up. That next command now exists: see **Flow** below.
+Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For accurate, complete values the real options are local: **librosa/Essentia** analysis of audio files you own, or **Mixed In Key / rekordbox** if the goal is DJ-grade key matching — both analyze actual audio rather than looking anything up. `resort` reorders a playlist in place using that data: `--by tempo` (slow-to-fast ramp), `--by key` (around the Camelot wheel, so neighbours mix harmonically), or `--by key-tempo` (key groups with tempo ramps inside). Always try `--dry-run` first; unknowns sink to the bottom in their current order. For chaining rather than sorting, see **Flow** below.
 
 ### Flow: making a playlist play smoothly
 
@@ -104,3 +112,7 @@ TuneMyMusic has **no public API** — the CSV format *is* the integration. `impo
 - Genius `search_songs` matches titles/metadata, then kimbo scores full lyrics. True lyric-text search isn't in Genius's public API, so discovery breadth is bounded by what the query surfaces — run several phrasings.
 - GetSongBPM rate-limits the free tier; `enrich` sleeps 0.6s between lookups. A 115-track list takes ~90 seconds.
 - Two different recordings of one song (single vs. album) have different Spotify IDs; the duplicate guard is by ID, so a re-import can occasionally re-add the *other* recording. Fix by hand when it happens.
+
+## Credits
+
+Tempo and key data in the `enrich` and `resort` commands is provided by **[GetSongBPM](https://getsongbpm.com)** — a free, community-maintained database of song tempo, key and time signature. Lyrics for the `discover` command come from [Genius](https://genius.com) via [lyricsgenius](https://github.com/johnwmillr/LyricsGenius). Spotify access uses [Spotipy](https://spotipy.readthedocs.io).
