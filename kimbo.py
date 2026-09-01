@@ -16,6 +16,7 @@ environment variables; see .env.example.
 
 import argparse
 import csv
+import math
 import os
 import re
 import sys
@@ -415,6 +416,114 @@ def cmd_enrich(args):
         print("Note: GetSongBPM's terms require a visible link back to "
               "getsongbpm.com wherever you publish their data.")
 
+
+
+# ------------------------------------------------------------------- flow ---
+
+# Enharmonic flats -> the sharp names used in PITCH_CLASSES.
+FLAT_TO_SHARP = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#",
+                 "Bb": "A#", "Cb": "B", "Fb": "E"}
+
+# (root as sharp name, is_minor) -> Camelot code. The full 24-key wheel:
+# neighbours on the wheel (+/-1, or the same number in the other letter)
+# are the pairs DJs treat as harmonically compatible.
+CAMELOT = {
+    ("G#", True): "1A",  ("B", False): "1B",
+    ("D#", True): "2A",  ("F#", False): "2B",
+    ("A#", True): "3A",  ("C#", False): "3B",
+    ("F", True): "4A",   ("G#", False): "4B",
+    ("C", True): "5A",   ("D#", False): "5B",
+    ("G", True): "6A",   ("A#", False): "6B",
+    ("D", True): "7A",   ("F", False): "7B",
+    ("A", True): "8A",   ("C", False): "8B",
+    ("E", True): "9A",   ("G", False): "9B",
+    ("B", True): "10A",  ("D", False): "10B",
+    ("F#", True): "11A", ("A", False): "11B",
+    ("C#", True): "12A", ("E", False): "12B",
+}
+
+FLOW_W_KEY = 1.0         # weight: harmonic compatibility
+FLOW_W_BPM = 1.0         # weight: tempo distance
+FLOW_W_ARC = 0.8         # weight: fit to the energy arc
+FLOW_UNKNOWN_PEN = 0.3   # neutral penalty when key or tempo is unknown
+FLOW_SMOOTH_KEY = 0.25   # max key penalty still called "smooth"
+FLOW_SMOOTH_BPM = 0.09   # max tempo log2-distance still called "smooth" (~6%)
+
+
+def normalize_key(raw):
+    """('A#', True) for 'Bbm'. None when missing or unparseable.
+
+    Accepts what GetSongBPM and djay screenshots actually contain: flats,
+    unicode accidentals, and 'minor'/'min'/'m' spellings."""
+    if raw is None:
+        return None
+    text = str(raw).replace("\u266f", "#").replace("\u266d", "b").strip()
+    if not text or text == "?":
+        return None
+    is_minor = False
+    lowered = text.lower()
+    for suffix in ("minor", "min", "m"):        # longest first
+        if lowered.endswith(suffix):
+            text, is_minor = text[:-len(suffix)], True
+            break
+    else:
+        for suffix in ("major", "maj"):
+            if lowered.endswith(suffix):
+                text = text[:-len(suffix)]
+                break
+    text = text.strip()
+    if not text:
+        return None
+    root = text[0].upper() + text[1:].lower()
+    root = FLAT_TO_SHARP.get(root, root)
+    return (root, is_minor) if root in PITCH_CLASSES else None
+
+
+def to_camelot(raw):
+    """'Am' -> '8A'. None when the key is missing or unparseable."""
+    parts = normalize_key(raw)
+    return CAMELOT.get(parts) if parts else None
+
+
+def camelot_parts(code):
+    """'11A' -> (11, 'A')."""
+    return int(code[:-1]), code[-1]
+
+
+def key_penalty(camelot_a, camelot_b):
+    """0.0 for the same key, rising with distance around the wheel.
+
+    An unknown key on either side scores FLOW_UNKNOWN_PEN - worse than a
+    neighbour, better than the far side of the wheel."""
+    if not camelot_a or not camelot_b:
+        return FLOW_UNKNOWN_PEN
+    num_a, letter_a = camelot_parts(camelot_a)
+    num_b, letter_b = camelot_parts(camelot_b)
+    ring = min((num_a - num_b) % 12, (num_b - num_a) % 12)
+    return min(1.0, 0.15 * ring + 0.25 * (0 if letter_a == letter_b else 1))
+
+
+def bpm_gap(tempo_a, tempo_b):
+    """(log2 distance, ratio) for the closest of half, same, or double time.
+
+    174 into 87 is a clean beatmatch rather than a jarring jump - the real
+    DJ move that a naive tempo sort mistakes for whiplash. Callers must
+    check both tempos are known and positive first; this does not."""
+    best = None
+    for ratio in (0.5, 1.0, 2.0):
+        dist = abs(math.log2(tempo_b * ratio / tempo_a))
+        if best is None or dist < best[0] - 1e-9:
+            best = (dist, ratio)
+        elif abs(dist - best[0]) <= 1e-9 and ratio == 1.0:
+            best = (dist, ratio)          # a straight match wins a tie
+    return best
+
+
+def bpm_penalty(tempo_a, tempo_b):
+    """0.0 for an exact (or half/double) match, 1.0 for a wide jump."""
+    if not tempo_a or not tempo_b or tempo_a <= 0 or tempo_b <= 0:
+        return FLOW_UNKNOWN_PEN
+    return min(1.0, bpm_gap(tempo_a, tempo_b)[0] / 0.5)
 
 
 # ------------------------------------------------------------------ setup ---

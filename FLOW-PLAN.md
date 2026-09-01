@@ -540,7 +540,7 @@ diff against this spec.
 
 ### Progress
 
-- [ ] Phase 1 — camelot + compatibility math
+- [x] Phase 1 — camelot + compatibility math
 - [ ] Phase 2 — ordering engine
 - [ ] Phase 3 — CSV mode + report + fixture
 - [ ] Phase 4 — tag-prompt
