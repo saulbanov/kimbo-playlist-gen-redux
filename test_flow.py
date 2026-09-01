@@ -173,7 +173,7 @@ class TestFlowCsvRoundTrip(unittest.TestCase):
 
     def flow_args(self, **overrides):
         args = {"csv": self.source, "playlist_id": None, "arc": "party",
-                "out": None}
+                "out": None, "tag_prompt": False}
         args.update(overrides)
         return argparse.Namespace(**args)
 
@@ -201,6 +201,42 @@ class TestFlowCsvRoundTrip(unittest.TestCase):
         note, smooth, _ = kimbo.join_quality(fast, slow)
         self.assertTrue(smooth)
         self.assertIn("half/double-time", note)
+
+
+class TestTaggingPrompt(unittest.TestCase):
+    """The handoff that keeps vibe a judgment call rather than a guess."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.source = os.path.join(self.tmp, "garden.csv")
+        shutil.copy(FIXTURE, self.source)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_prompt_carries_the_ask_and_the_tracks(self):
+        out = os.path.join(self.tmp, "tagging.txt")
+        kimbo.cmd_flow(argparse.Namespace(
+            csv=self.source, playlist_id=None, arc="party", out=out,
+            tag_prompt=True))
+        with open(out, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("Energy column", text)
+        self.assertIn("Track name,Artist name", text)
+        self.assertIn("Last Slice", text)
+
+    def test_missing_columns_are_added_for_the_model_to_fill(self):
+        bare = os.path.join(self.tmp, "bare.csv")
+        with open(bare, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(kimbo.CSV_HEADER)
+            writer.writerow(["Golden Hour", "June & the Latches", "Porch Light"])
+        out = os.path.join(self.tmp, "bare-tagging.txt")
+        kimbo.cmd_flow(argparse.Namespace(
+            csv=bare, playlist_id=None, arc="party", out=out, tag_prompt=True))
+        with open(out, encoding="utf-8") as f:
+            header = f.read().split("\n\n", 1)[1].splitlines()[0]
+        self.assertTrue(header.endswith("Energy,Vibe"), header)
 
 
 if __name__ == "__main__":

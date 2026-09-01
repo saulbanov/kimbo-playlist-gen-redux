@@ -465,6 +465,18 @@ ARC_BREAKPOINTS = {
 FLOW_CSV_HEADER = CSV_HEADER + ["Tempo", "Key", "Camelot", "Energy",
                                 "Vibe", "Source"]
 
+# Handed to whatever assistant the user already has. Tempo and key are
+# lookups; how a track FEELS is the judgment call, so we ask for it rather
+# than pretending a number implies it.
+FLOW_TAG_PROMPT = """You are tagging songs for playlist ordering. For each track in the CSV
+below, fill in the Energy column with a rating from 1 (sleepy, ambient)
+to 5 (peak, floor-filling), judging how the track FEELS, not how fast it
+is - a delicate piano piece can be fast and still low energy. Fill in the
+Vibe column with one word (e.g. dreamy, swagger, sunshine, brooding).
+Reply with ONLY the completed CSV: same columns, same row order, nothing
+else. If you don't know a track, rate it 3 and guess the vibe from the
+title."""
+
 
 def normalize_key(raw):
     """('A#', True) for 'Bbm'. None when missing or unparseable.
@@ -733,11 +745,43 @@ def write_flow_csv(path, tracks, order):
                              track["vibe"], track["source"]])
 
 
+def write_tagging_prompt(source, out):
+    """The prompt block, then the CSV with Energy/Vibe columns to fill in."""
+    with open(source, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        die("%s is empty" % source)
+    if "track name" in [c.strip().lower() for c in rows[0]]:
+        head, body = list(rows[0]), [list(r) for r in rows[1:]]
+    else:
+        head, body = ["Track name", "Artist name"], [list(r) for r in rows]
+    present = [c.strip().lower() for c in head]
+    for column in ("Energy", "Vibe"):
+        if column.lower() not in present:
+            head.append(column)
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        f.write(FLOW_TAG_PROMPT + "\n\n")
+        writer = csv.writer(f)
+        writer.writerow(head)
+        for row in body:
+            writer.writerow(row + [""] * (len(head) - len(row)))
+
+
 def cmd_flow(args):
     if bool(args.csv) == bool(args.playlist_id):
         die("pass exactly one of --csv or --playlist-id")
+    if args.tag_prompt and args.playlist_id:
+        die("--tag-prompt needs a CSV - run `export` then `enrich` first")
     if args.playlist_id:
         die("playlist mode arrives in a later phase")
+
+    if args.tag_prompt:
+        out = args.out or (args.csv.rsplit(".csv", 1)[0] + "-tagging.txt")
+        write_tagging_prompt(args.csv, out)
+        print("Wrote %s" % out)
+        print("Paste it to any assistant, save the reply as a CSV, then run:")
+        print("  python3 kimbo.py flow --csv <that file>")
+        return
 
     tracks = read_enriched_rows(args.csv)
     if not tracks:
@@ -935,6 +979,8 @@ def main():
     p.add_argument("--arc", default="party",
                    choices=["flat", "steady", "party", "chill", "build"],
                    help="energy curve to shape the set around (default party)")
+    p.add_argument("--tag-prompt", action="store_true",
+                   help="write an LLM prompt for filling in Energy/Vibe")
     p.add_argument("--out", help="output path (default: <input>-flow.csv)")
     p.set_defaults(func=cmd_flow)
 
