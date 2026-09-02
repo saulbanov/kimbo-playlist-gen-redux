@@ -224,6 +224,8 @@ def import_one(args, sp, csv_path, title):
     print("Added %d tracks (%d already present, %d unmatched)."
           % (len(to_add), len(resolved) - len(to_add), len(misses)))
     print("Playlist: https://open.spotify.com/playlist/" + playlist_id)
+    if getattr(args, "resort", None):
+        resort_playlist(sp, playlist_id, args.resort, analyze=getattr(args, "analyze", False))
     return len(to_add), len(misses)
 
 
@@ -406,6 +408,97 @@ def cmd_discover(args):
     print("Playlist: https://open.spotify.com/playlist/" + playlist_id)
 
 
+
+# ---------------------------------------------------------------- analyze ---
+# Fallback for tracks GetSongBPM doesn't know: fetch Deezer's keyless 30-second
+# preview and compute tempo + key locally. Spotify computed these for its whole
+# catalog and stopped serving them (Nov 2024); this is the do-it-yourself route.
+# Measured: band recordings come back within a few BPM and the right key at
+# 0.7-0.8 confidence; solo fingerpicked blues (no drummer) beat-tracks badly,
+# so low-confidence keys are blanked rather than trusted.
+
+KK_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+KK_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+ANALYZE_MIN_CONF = 0.5
+
+
+def _norm(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def deezer_preview(session, title, artist):
+    """30-second preview URL for the studio recording, or None. Gates on the
+    artist and rejects live/karaoke/tribute hits unless the title asks."""
+    try:
+        response = session.get("https://api.deezer.com/search",
+                               params={"q": "%s %s" % (title, artist), "limit": 8}, timeout=15)
+        hits = response.json().get("data") or []
+    except (requests.RequestException, ValueError):
+        return None
+    want_artist, want_title = _norm(artist), _norm(title)
+    bad = ("live", "karaoke", "tribute", "cover", "instrumental")
+    for hit in hits:
+        got_artist = _norm((hit.get("artist") or {}).get("name"))
+        got_title = _norm(hit.get("title"))
+        if not hit.get("preview"):
+            continue
+        if not (want_artist in got_artist or got_artist in want_artist):
+            continue
+        if any(b in got_title and b not in want_title for b in bad):
+            continue
+        if want_title not in got_title and got_title not in want_title:
+            continue
+        return hit["preview"]
+    return None
+
+
+def analyze_preview(session, url):
+    """(tempo, key, confidence) from a preview MP3, or None."""
+    try:
+        import numpy as np
+        import librosa
+    except ImportError:
+        die("--analyze needs librosa: pip3 install librosa soundfile")
+    import tempfile, warnings
+    warnings.filterwarnings("ignore")
+    try:
+        audio = session.get(url, timeout=30).content
+    except requests.RequestException:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        f.write(audio)
+        path = f.name
+    try:
+        y, sr = librosa.load(path, sr=22050, mono=True)
+    except Exception:
+        return None
+    finally:
+        os.unlink(path)
+    tempo = float(np.atleast_1d(librosa.feature.tempo(y=y, sr=sr))[0])
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
+    best = (-2.0, "")
+    for shift in range(12):
+        for suffix, profile in (("", KK_MAJOR), ("m", KK_MINOR)):
+            score = float(np.corrcoef(np.roll(profile, shift), chroma)[0, 1])
+            if score > best[0]:
+                best = (score, PITCH_CLASSES[shift] + suffix)
+    return round(tempo), best[1], round(best[0], 2)
+
+
+def analyze_track(session, title, artist):
+    """(tempo, key, source) or None. Low-confidence keys are blanked."""
+    url = deezer_preview(session, title, artist)
+    if not url:
+        return None
+    result = analyze_preview(session, url)
+    if not result:
+        return None
+    tempo, key, conf = result
+    if conf < ANALYZE_MIN_CONF:
+        key = ""
+    return str(tempo), key, "analyzed(%.2f)" % conf
+
+
 # ----------------------------------------------------------------- enrich ---
 
 def spotify_features(sp, track_ids):
@@ -482,17 +575,18 @@ def getsongbpm_notice(api_key):
               "getsongbpm.com wherever you publish their data.")
 
 
-def gather_tempo_key(sp, rows3, ids):
+def gather_tempo_key(sp, rows3, ids, analyze=False):
     """(tempo, key, source) per row, aligned with rows3.
 
     Spotify's own features first for grandfathered apps, then the local
-    cache, then a GetSongBPM lookup."""
+    cache, then a GetSongBPM lookup, then (with analyze=True) a Deezer
+    preview analyzed locally."""
     by_id = {}
     if ids and sp:
         by_id = spotify_features(sp, ids)
 
     api_key = os.environ.get("GETSONGBPM_KEY")
-    cache = load_bpm_cache() if api_key else {}
+    cache = load_bpm_cache() if (api_key or analyze) else {}
     session = requests.Session()
     found, learned = [], False
     for i, (title, artist, album) in enumerate(rows3):
@@ -509,6 +603,15 @@ def gather_tempo_key(sp, rows3, ids):
                     tempo, key, source = hit
                     cache[slot], learned = [tempo, key], True
                 time.sleep(0.6)          # be polite; free tier rate-limits
+        if not (tempo or key) and analyze:
+            slot = ("%s|%s" % (title, artist)).lower()
+            if slot in cache and cache[slot][0]:
+                tempo, key, source = cache[slot][0], cache[slot][1], "cache"
+            else:
+                hit = analyze_track(session, title, artist)
+                if hit:
+                    tempo, key, source = hit
+                    cache[slot], learned = [tempo, key], True
         found.append((tempo, key, source))
         print("  %-7s %-4s %s - %s" % (tempo or "-", key or "-", artist, title))
     if learned:
@@ -529,7 +632,7 @@ def cmd_enrich(args):
 
     out_rows = [[title, artist, album, tempo, key, source]
                 for (title, artist, album), (tempo, key, source)
-                in zip(rows3, gather_tempo_key(sp, rows3, ids))]
+                in zip(rows3, gather_tempo_key(sp, rows3, ids, analyze=args.analyze))]
 
     out = args.out or ((args.csv or "playlist").rsplit(".csv", 1)[0] + "-enriched.csv")
     with open(out, "w", newline="", encoding="utf-8") as f:
@@ -947,7 +1050,7 @@ def flow_from_playlist(args):
     if not rows3:
         die("playlist '%s' has no tracks" % name)
     print("Reading tempo and key for %d tracks in '%s'..." % (len(rows3), name))
-    found = gather_tempo_key(sp, rows3, ids)
+    found = gather_tempo_key(sp, rows3, ids, analyze=getattr(args, "analyze", False))
     getsongbpm_notice(os.environ.get("GETSONGBPM_KEY"))
 
     tracks = []
@@ -963,6 +1066,27 @@ def flow_from_playlist(args):
 
 
 def cmd_flow(args):
+    if args.prefix:
+        if args.csv or args.playlist_id or args.tag_prompt or args.out:
+            die("--prefix is a batch over playlists you own; combine it only with "
+                "--arc, --apply/--in-place, --analyze")
+        sp = spotify_client()
+        targets = playlists_with_prefix(sp, args.prefix)
+        if not targets:
+            die("no playlists you own start with %r" % args.prefix)
+        print("flow over %d playlists starting with %r (arc: %s):" % (len(targets), args.prefix, args.arc))
+        for _, name in targets:
+            print("  " + name)
+        for pid, name in targets:
+            print("\n" + "=" * 60 + "\n%s" % name)
+            args.playlist_id = pid
+            cmd_flow_one(args)
+        args.playlist_id = None
+        return
+    cmd_flow_one(args)
+
+
+def cmd_flow_one(args):
     if bool(args.csv) == bool(args.playlist_id):
         die("pass exactly one of --csv or --playlist-id")
     if args.tag_prompt and args.playlist_id:
@@ -1170,32 +1294,23 @@ def sort_key(row, by):
     return (cam is None and tempo is None, cam or big, tempo or 0)   # key-tempo
 
 
-def cmd_resort(args):
-    sp = spotify_client()
-    playlist_id = args.playlist_id or playlist_by_title(sp, args.title or "")
-    if not playlist_id:
-        die("playlist not found - pass --playlist-id or an exact --title you own")
+def resort_playlist(sp, playlist_id, by, desc=False, dry_run=False, label="", analyze=False):
+    """Look up tempo/key for every track and rewrite the playlist in that
+    order. Returns (known, total)."""
     rows = playlist_rows(sp, playlist_id)
     ids = playlist_track_ids(sp, playlist_id)
+    if label:
+        print("\n" + "=" * 60 + "\n%s" % label)
 
     print("Looking up tempo/key for %d tracks..." % len(rows))
-    by_id = spotify_features(sp, ids)
     api_key = os.environ.get("GETSONGBPM_KEY")
-    session = requests.Session()
-    enriched = []
-    for i, (title, artist, album) in enumerate(rows):
-        tempo, key = "", ""
-        if i < len(ids) and ids[i] in by_id:
-            tempo, key, _ = by_id[ids[i]]
-        elif api_key:
-            hit = getsongbpm_lookup(session, api_key, title, artist)
-            if hit:
-                tempo, key = hit[0], hit[1]
-            time.sleep(0.6)
-        enriched.append((title, artist, album, tempo, key, ids[i] if i < len(ids) else None))
+    by_id = spotify_features(sp, ids)   # cheap probe; tells the user if grandfathered
+    found = gather_tempo_key(sp, rows, ids, analyze=analyze)
+    enriched = [(title, artist, album, tempo, key, ids[i] if i < len(ids) else None)
+                for i, ((title, artist, album), (tempo, key, _src)) in enumerate(zip(rows, found))]
 
-    order = sorted(enriched, key=lambda r: sort_key(r, args.by), reverse=args.desc)
-    print("\nProposed order (--by %s%s):" % (args.by, ", descending" if args.desc else ""))
+    order = sorted(enriched, key=lambda r: sort_key(r, by), reverse=desc)
+    print("\nProposed order (--by %s%s):" % (by, ", descending" if desc else ""))
     known = 0
     for title, artist, album, tempo, key, _tid in order:
         cam = camelot(key)
@@ -1204,9 +1319,9 @@ def cmd_resort(args):
               ("%d%s" % cam) if cam else "-", artist, title))
     print("\n%d/%d tracks had tempo/key data; unknowns sink to the bottom in "
           "their current order." % (known, len(order)))
-    if args.dry_run:
+    if dry_run:
         print("--dry-run: playlist untouched.")
-        return
+        return known, len(order)
     if not api_key and not by_id:
         die("no tempo/key data at all - set GETSONGBPM_KEY (kimbo.py setup) "
             "before resorting, or this would just shuffle unknowns")
@@ -1215,6 +1330,44 @@ def cmd_resort(args):
     for start in range(100, len(new_ids), 100):
         sp.playlist_add_items(playlist_id, new_ids[start:start + 100])
     print("Reordered in place: https://open.spotify.com/playlist/" + playlist_id)
+    return known, len(order)
+
+
+def playlists_with_prefix(sp, prefix):
+    """[(id, name)] for every playlist the user owns whose name starts with prefix."""
+    me = sp.me()["id"]
+    found, page = [], sp.current_user_playlists(limit=50)
+    while page:
+        for pl in page["items"]:
+            if pl["owner"]["id"] == me and pl["name"].startswith(prefix):
+                found.append((pl["id"], pl["name"]))
+        page = sp.next(page) if page.get("next") else None
+    return sorted(found, key=lambda t: t[1])
+
+
+def cmd_resort(args):
+    sp = spotify_client()
+    if args.prefix:
+        targets = playlists_with_prefix(sp, args.prefix)
+        if not targets:
+            die("no playlists you own start with %r" % args.prefix)
+        print("Resorting %d playlists starting with %r by %s:" % (len(targets), args.prefix, args.by))
+        for _, name in targets:
+            print("  " + name)
+        summary = []
+        for pid, name in targets:
+            known, total = resort_playlist(sp, pid, args.by, args.desc, args.dry_run, label=name,
+                                           analyze=args.analyze)
+            summary.append((name, known, total))
+        print("\n" + "=" * 60 + "\n%s" % ("Dry run - nothing changed." if args.dry_run else "Done."))
+        for name, known, total in summary:
+            print("  %-34s %2d/%2d with data" % (name, known, total))
+        return
+    playlist_id = args.playlist_id or playlist_by_title(sp, args.title or "")
+    if not playlist_id:
+        die("playlist not found - pass --playlist-id, an exact --title you own, "
+            "or --prefix to do a batch")
+    resort_playlist(sp, playlist_id, args.by, args.desc, args.dry_run, analyze=args.analyze)
 
 
 # -------------------------------------------------------------------- CLI ---
@@ -1235,6 +1388,11 @@ def main():
     p.add_argument("--playlist-id", help="add to an existing playlist instead")
     p.add_argument("--public", action="store_true", help="create as public (default private)")
     p.add_argument("--replace", action="store_true", help="clear the playlist first")
+    p.add_argument("--analyze", action="store_true",
+                   help="for tracks GetSongBPM lacks, fetch a 30s Deezer preview and compute "
+                        "tempo/key locally (pip3 install librosa soundfile)")
+    p.add_argument("--resort", choices=["tempo", "key", "key-tempo"],
+                   help="after importing, reorder each playlist by this (needs GETSONGBPM_KEY)")
     p.add_argument("--dry-run", action="store_true", help="resolve and report, write nothing")
     p.set_defaults(func=cmd_import)
 
@@ -1259,16 +1417,23 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="score and print, add nothing")
     p.set_defaults(func=cmd_discover)
 
-    p = sub.add_parser("resort", help="reorder a playlist in place by tempo/key")
+    p = sub.add_parser("resort", help="reorder playlists in place by tempo/key")
     p.add_argument("--playlist-id")
     p.add_argument("--title", help="exact name of a playlist you own")
+    p.add_argument("--prefix", help="batch: every playlist you own whose name starts with this")
     p.add_argument("--by", choices=["tempo", "key", "key-tempo"], default="tempo",
                    help="tempo ramp, Camelot-wheel key order, or key groups with tempo ramps inside")
+    p.add_argument("--analyze", action="store_true",
+                   help="for tracks GetSongBPM lacks, fetch a 30s Deezer preview and compute "
+                        "tempo/key locally (pip3 install librosa soundfile)")
     p.add_argument("--desc", action="store_true", help="high to low")
     p.add_argument("--dry-run", action="store_true", help="print the proposed order, change nothing")
     p.set_defaults(func=cmd_resort)
 
     p = sub.add_parser("enrich", help="add tempo/key columns")
+    p.add_argument("--analyze", action="store_true",
+                   help="for tracks GetSongBPM lacks, fetch a 30s Deezer preview and compute "
+                        "tempo/key locally (pip3 install librosa soundfile)")
     p.add_argument("--csv")
     p.add_argument("--playlist-id")
     p.add_argument("--out")
@@ -1277,6 +1442,10 @@ def main():
     p = sub.add_parser("flow", help="reorder so the playlist plays smoothly")
     p.add_argument("--csv", help="an enriched CSV (see `enrich`)")
     p.add_argument("--playlist-id", help="reorder a playlist you own")
+    p.add_argument("--prefix", help="batch: every playlist you own whose name starts with this")
+    p.add_argument("--analyze", action="store_true",
+                   help="for tracks GetSongBPM lacks, fetch a 30s Deezer preview and compute "
+                        "tempo/key locally (pip3 install librosa soundfile)")
     p.add_argument("--arc", default="party",
                    choices=["flat", "steady", "party", "chill", "build"],
                    help="energy curve to shape the set around (default party)")
