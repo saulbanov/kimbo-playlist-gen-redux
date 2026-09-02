@@ -42,6 +42,7 @@ python3 kimbo.py resort   --title "Black Waters" --by key-tempo --dry-run
 python3 kimbo.py resort   --title "Black Waters" --by tempo    # reorder in place
 python3 kimbo.py flow     --csv list-enriched.csv --arc party   # writes list-enriched-flow.csv
 python3 kimbo.py flow     --playlist-id 3cEYpjA9... --apply     # new "<name> (flow)" playlist
+python3 kimbo.py flow     --prefix "S&T" --arc flat --apply --analyze   # ALL of them, one run
 ```
 
 Useful flags: `setup --check` (validate credentials); `import --dry-run` (resolve and report, write nothing), `--replace` (clear first), `--public` (playlists default to private); `discover --source genius|spotify|both`, `--min-lyrics` (skip stub pages). `flow --arc flat|steady|party|chill|build`, `--tag-prompt` (write the vibe-tagging prompt), `--apply` / `--in-place` (push the new order back).
@@ -57,7 +58,7 @@ Header `Track name, Artist name, Album` (TuneMyMusic's format — the files in `
 
 ### Tempo and key: the honest state
 
-Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For accurate, complete values the real options are local: **librosa/Essentia** analysis of audio files you own, or **Mixed In Key / rekordbox** if the goal is DJ-grade key matching — both analyze actual audio rather than looking anything up. `resort` reorders a playlist in place using that data: `--by tempo` (slow-to-fast ramp), `--by key` (around the Camelot wheel, so neighbours mix harmonically), or `--by key-tempo` (key groups with tempo ramps inside). Always try `--dry-run` first; unknowns sink to the bottom in their current order. For chaining rather than sorting, see **Flow** below.
+Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without previously-approved extended quota get 403s, and there is no replacement. `enrich` still tries it first (grandfathered apps work) and falls back to **GetSongBPM**, whose free API returns tempo and key by search — coverage is decent for known songs, thin for prewar blues and Bandcamp-tier releases. Their terms require a visible link back to getsongbpm.com wherever the data is published. For the tracks GetSongBPM doesn't know, add **`--analyze`** (to `enrich`, `resort`, `flow` or `import --resort`): kimbo fetches Deezer's keyless 30-second preview of the studio recording — gated on artist and title, live cuts and covers rejected — and computes tempo and key locally with librosa (`pip3 install librosa soundfile`; ~1–15 s per track, results cached). Measured on known songs: band recordings land within a few BPM and in the right key at 0.7–0.8 confidence ("9 to 5": 103 BPM, F♯). Solo fingerpicked blues with no drummer beat-tracks badly *whatever* the source — that is most of the thin set — so keys under 0.5 confidence are blanked rather than trusted, and those tracks still sink. DJ-grade accuracy remains a local-audio job: **Mixed In Key / rekordbox** on files you own. `resort` reorders a playlist in place using that data: `--by tempo` (slow-to-fast ramp), `--by key` (around the Camelot wheel, so neighbours mix harmonically), or `--by key-tempo` (key groups with tempo ramps inside). Always try `--dry-run` first; unknowns sink to the bottom in their current order. For chaining rather than sorting, see **Flow** below.
 
 ### Flow: making a playlist play smoothly
 
@@ -70,6 +71,8 @@ Spotify's `audio-features` endpoint was deprecated **27 Nov 2024**; apps without
 **Energy arc.** Pick the shape of the night with `--arc`: `party` (warm up, build, peak, wind down), `steady` (hold one level — a bike ride), `chill` (gentle descent), `build` (straight climb — a workout), or `flat` (no arc, just the smoothest possible chain of songs).
 
 It prints every transition with a verdict — `smooth`, `key jump`, `tempo jump`, or `?` where data is missing — and a count of rough joins before and after, so you can see what it bought you.
+
+**Batch.** `--prefix "S&T"` runs it over every playlist you own whose name starts with that, so the whole rack goes in one command. With `--apply` each one gets a new private "<name> (flow)" copy and the curated original is untouched — the right way to treat the sequenced playlists, whose hand-built order is the point. Add `--analyze` so the prewar and Bandcamp-tier tracks get looked at rather than skipped.
 
 #### The vibe pass
 
