@@ -1,3 +1,3 @@
-spotipy>=2.23
+spotipy>=2.26
 lyricsgenius>=3.0
 requests>=2.31

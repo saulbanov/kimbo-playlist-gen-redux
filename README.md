@@ -111,6 +111,7 @@ TuneMyMusic has **no public API** — the CSV format *is* the integration. `impo
 
 ### Gotchas
 
+- **Spotify's February 2026 API migration** (enforced 9 March 2026 for Development Mode apps) removed `POST /users/{id}/playlists` and renamed `/playlists/{id}/tracks` to `/items`, with `track` → `item` in responses. kimbo uses the new endpoints and accepts both response shapes; it needs **spotipy ≥ 2.26**. A `403 Forbidden` on `.../users/.../playlists` means an older kimbo or spotipy.
 - `lyricsgenius` scrapes genius.com HTML; it breaks when Genius changes markup and sometimes returns empty lyrics. `discover` treats those as skips, not crashes.
 - Genius `search_songs` matches titles/metadata, then kimbo scores full lyrics. True lyric-text search isn't in Genius's public API, so discovery breadth is bounded by what the query surfaces — run several phrasings.
 - GetSongBPM rate-limits the free tier; `enrich` sleeps 0.6s between lookups. A 115-track list takes ~90 seconds.

@@ -99,11 +99,31 @@ def playlist_by_title(sp, title):
     return None
 
 
+def create_playlist(sp, name, public=False, description=""):
+    """POST /me/playlists. Spotify removed POST /users/{id}/playlists for
+    Development Mode apps on 2026-03-09; spotipy's user_playlist_create
+    still calls it and 403s. Use the new method when spotipy has one,
+    else hit the endpoint directly."""
+    for method in ("current_user_playlist_create", "me_playlist_create"):
+        fn = getattr(sp, method, None)
+        if fn:
+            return fn(name, public=public, description=description)["id"]
+    return sp._post("me/playlists", payload={"name": name, "public": public,
+                                             "collaborative": False,
+                                             "description": description})["id"]
+
+
+def item_track(item):
+    """The track inside a playlist-items row. The 2026 API renamed the
+    field from 'track' to 'item'; accept both."""
+    return item.get("item") or item.get("track") or {}
+
+
 def playlist_track_ids(sp, playlist_id):
     ids, page = [], sp.playlist_items(playlist_id, additional_types=("track",))
     while page:
         for item in page["items"]:
-            track = item.get("track") or {}
+            track = item_track(item)
             if track.get("id"):
                 ids.append(track["id"])
         page = sp.next(page) if page.get("next") else None
@@ -115,7 +135,7 @@ def playlist_rows(sp, playlist_id):
     rows, page = [], sp.playlist_items(playlist_id, additional_types=("track",))
     while page:
         for item in page["items"]:
-            track = item.get("track") or {}
+            track = item_track(item)
             if track.get("id"):
                 rows.append((track["name"],
                              track["artists"][0]["name"] if track.get("artists") else "",
@@ -205,9 +225,8 @@ def import_one(args, sp, csv_path, title):
         if playlist_id:
             print("\nUsing existing playlist '%s'" % title)
         else:
-            playlist_id = sp.user_playlist_create(
-                sp.me()["id"], title, public=args.public,
-                description="Imported by kimbo")["id"]
+            playlist_id = create_playlist(sp, title, public=args.public,
+                                          description="Imported by kimbo")
             print("\nCreated %s playlist '%s'" % ("public" if args.public else "private", title))
 
     if args.replace:
@@ -392,9 +411,8 @@ def cmd_discover(args):
     sp = sp or spotify_client()
     title = args.title or ("candidates - %s" % args.query)
     # Resolve and add, preserving score order.
-    playlist_id = args.playlist_id or playlist_by_title(sp, title) or sp.user_playlist_create(
-        sp.me()["id"], title, public=False,
-        description="kimbo discover: %s" % args.query)["id"]
+    playlist_id = args.playlist_id or playlist_by_title(sp, title) or create_playlist(
+        sp, title, public=False, description="kimbo discover: %s" % args.query)
     existing = set(playlist_track_ids(sp, playlist_id))
     added = 0
     for score, song_title, artist in candidates:
