@@ -1031,9 +1031,8 @@ def flow_write_back(sp, args, name, tracks, order):
     dropped = len(order) - len(ordered_ids)
     if args.apply:
         new_name = "%s (flow)" % name
-        new_id = sp.user_playlist_create(
-            sp.me()["id"], new_name, public=False,
-            description="kimbo flow: %s arc" % args.arc)["id"]
+        new_id = create_playlist(sp, new_name, public=False,
+            description="kimbo flow: %s arc" % args.arc)
         add_in_batches(sp, new_id, ordered_ids)
         if dropped:
             warn("%d track(s) had no Spotify id and were left out" % dropped)
